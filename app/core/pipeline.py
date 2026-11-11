@@ -33,7 +33,10 @@ def _trash(path: Path) -> Path:
 
 
 class Pipeline:
-    def __init__(self, settings_store, ai, memory, history, dupindex, schemes, bus):
+    def __init__(self, settings_store, ai, memory, history, dupindex, schemes, bus, hints=None, ignored=None):
+        from ..store.hints import Hints, Ignored
+        self.hints = hints or Hints()
+        self.ignored = ignored or Ignored()
         self.settings_store = settings_store
         self.ai = ai
         self.memory = memory
@@ -96,7 +99,7 @@ class Pipeline:
         now = time.monotonic()
         for p in sorted(inbox.iterdir(), key=lambda x: x.name.lower()):
             sp = str(p)
-            if sp in known or sp in self._ignored_inbox or not reader.is_supported(p):
+            if sp in known or sp in self._ignored_inbox or not reader.is_supported(p) or self.ignored.has_path(sp):
                 continue
             try:
                 size = p.stat().st_size
@@ -169,6 +172,11 @@ class Pipeline:
             raise FileNotFoundError(src)
         sha = item.get("sha") or reader.file_hash(src)
         item["sha"] = sha
+        if self.ignored.has_sha(sha):  # als „kein Dokument“ markiert → still übergehen
+            self._ignored_inbox.add(str(src))
+            with self._lock:
+                self.items.pop(item["id"], None)
+            return
         if item["origin"] == "inbox" and not item["dup_ignored"]:
             hit = self.dup.find(sha, [], exclude=src)
             if hit:
@@ -233,7 +241,8 @@ class Pipeline:
             self.ai, text=item["text"], original=Path(item["src"]), kind=item["kind"],
             page_count=item["page_count"], folders=folders,
             folder_info=self._folder_info(folders, with_files=item["origin"] == "inbox"),
-            examples=self.memory.similar(item["text"]), excluded=item["excluded"], allow_new=allow_new)
+            examples=self.memory.similar(item["text"]), excluded=item["excluded"], allow_new=allow_new,
+            user_hints=self.hints.relevant(item["text"]), doc_hint=item.get("hint", ""))
         suggestion["folder_display"] = naming.display_folder(suggestion["folder"])
         suggestion["alt_display"] = naming.display_folder(suggestion["alt_folder"])
         item.update(stage="doc", suggestion=suggestion, status="ready")
@@ -432,6 +441,38 @@ class Pipeline:
             item["excluded"].append(s["folder"])
         item.update(status="waiting", suggestion=None)
         self._jobs.put((PRIO_USER, next(self._seq), item_id, "classify"))
+        self._changed()
+
+    def give_hint(self, item_id: str, text: str, remember: bool = True) -> None:
+        """Neuer Vorschlag mit Hinweis des Nutzers; der Hinweis wird für ähnliche Dokumente gemerkt."""
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("Bitte einen Hinweis eingeben.")
+        item = self.get(item_id)
+        if item["status"] not in ("ready", "error"):
+            raise ValueError("Das Dokument wird gerade bearbeitet.")
+        if remember:
+            self.hints.add(text, "aehnlich", snippet=item.get("text", ""), source=item["name"])
+        item["hint"] = text
+        item["excluded"] = []  # der Hinweis darf auch einen vorher abgelehnten Ordner begründen
+        item.update(status="waiting", suggestion=None)
+        self._jobs.put((PRIO_USER, next(self._seq), item_id, "classify"))
+        self._changed()
+
+    def mark_not_document(self, item_id: str, reason: str = "foto") -> None:
+        """Datei bleibt liegen und wird nie wieder vorgeschlagen."""
+        with self._lock:
+            item = self.items.get(item_id)
+            if item is None or item["status"] not in ("ready", "error"):
+                raise ValueError("Das Dokument wird gerade bearbeitet.")
+            item["status"] = "moving"
+        src = Path(item["src"])
+        sha = item.get("sha") or (reader.file_hash(src) if src.exists() else "")
+        rec = self.ignored.add(sha, str(src), reason)
+        self._ignored_inbox.add(str(src))
+        self.history.add("ignore", str(src), str(src), "", ignore_id=rec["id"], reason=reason)
+        with self._lock:
+            self.items.pop(item_id, None)
         self._changed()
 
     def skip(self, item_id: str) -> None:

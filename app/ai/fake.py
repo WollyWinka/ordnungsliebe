@@ -60,6 +60,13 @@ class FakeAI:
     def _classify(self, user: str, schema: dict) -> dict:
         allowed = schema["properties"]["folder"]["enum"]
         doc = self._doc_part(user)
+        m = re.search(r"ZU GENAU DIESEM DOKUMENT[^:]*: (.*)", user)
+        if m:  # Test-KI: nennt der Hinweis einen Ordner, nimm ihn
+            hint = m.group(1).lower()
+            for f in allowed:
+                if f != prompts.NEW_FOLDER and f.split("/")[-1].lower() in hint:
+                    return {"summary": "Nach Hinweis eingeordnet", "doc_date": "", "folder": f, "new_folder": "",
+                            "alternative_folder": "", "filename": "2026-11 Dokument", "confidence": "sehr sicher"}
         folder, doc_type, hits, new_folder = None, "Dokument", 0, ""
         # Regeln sind von speziell nach allgemein sortiert: die erste passende gewinnt.
         for words, target, dtype in KEYWORDS:

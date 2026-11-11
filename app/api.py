@@ -96,8 +96,11 @@ class Api:
         self.dup = DuplicateIndex()
         self.schemes = library.Schemes()
         self.backups = reorg.Backups()
+        from .store.hints import Hints, Ignored
+        self.hints = Hints()
+        self.ignored = Ignored()
         self.pipeline = Pipeline(self.settings_store, self.ai, self.memory, self.history, self.dup,
-                                 self.schemes, bus)
+                                 self.schemes, bus, hints=self.hints, ignored=self.ignored)
         self.reorganizer = reorg.Reorganizer(self.settings_store, self.ai, self.pipeline, self.history,
                                              self.schemes, self.dup, self.backups, bus)
         self.models = setup.ModelManager(self.settings_store, bus)
@@ -373,6 +376,39 @@ class Api:
         return True
 
     @api_method
+    def give_hint(self, item_id: str, text: str):
+        self.pipeline.give_hint(item_id, text)
+        return True
+
+    @api_method
+    def not_document(self, item_id: str):
+        self.pipeline.mark_not_document(item_id, "foto")
+        return True
+
+    @api_method
+    def hints_view(self):
+        return {"hints": self.hints.list(), "ignored": self.ignored.count()}
+
+    @api_method
+    def hint_add_rule(self, text: str):
+        return self.hints.add(text, "alle", source="")
+
+    @api_method
+    def hint_update(self, hint_id: str, text: str = None, scope: str = None):
+        return self.hints.update(hint_id, text, scope)
+
+    @api_method
+    def hint_delete(self, hint_id: str):
+        self.hints.delete(hint_id)
+        return True
+
+    @api_method
+    def ignored_clear(self):
+        n = self.ignored.clear()
+        self.pipeline._ignored_inbox.clear()
+        return n
+
+    @api_method
     def skip(self, item_id: str):
         self.pipeline.skip(item_id)
         return True
@@ -421,7 +457,8 @@ class Api:
             if label not in days:
                 days[label] = []
                 order.append(label)
-            where = {"move": "nach " + naming.display_folder(e.get("folder", "")),
+            where = {"ignore": "als Foto markiert – wird nicht mehr vorgeschlagen",
+                     "move": "nach " + naming.display_folder(e.get("folder", "")),
                      "trash": "doppelt – zur Seite gelegt (30 Tage aufbewahrt)",
                      "split": f"in {len(e.get('info', {}).get('parts', []))} Dokumente aufgeteilt"}
             name = e["name"] if e["action"] != "trash" else Path(e["src"]).name
@@ -429,7 +466,8 @@ class Api:
                 "id": e["id"], "time": time.strftime("%H:%M", time.localtime(e["ts"])),
                 "name": name, "where": where.get(e["action"], ""), "undone": e["undone"],
                 "action": e["action"],
-                "undoable": e["action"] in ("move", "trash") and not e["undone"] and Path(e["dst"]).exists()})
+                "undoable": (e["action"] in ("move", "trash") and not e["undone"] and Path(e["dst"]).exists())
+                            or (e["action"] == "ignore" and not e["undone"])})
         groups = []
         for g in sorted(self.history.groups.values(), key=lambda g: g["ts"], reverse=True):
             if not g.get("done"):
@@ -447,6 +485,11 @@ class Api:
         entry = self.history.get(entry_id)
         if entry is None:
             raise KeyError("Eintrag nicht gefunden.")
+        if entry["action"] == "ignore":
+            self.ignored.remove(entry.get("info", {}).get("ignore_id", ""))
+            self.pipeline._ignored_inbox.discard(entry["src"])
+            self.history.mark_undone(entry_id)
+            return {"where": setup.pretty_path(entry["src"]), "ignore": True}
         where = reorg.undo_entry(entry, self.settings_store.get(), self.history, self.memory, self.dup)
         return {"where": setup.pretty_path(where)}
 

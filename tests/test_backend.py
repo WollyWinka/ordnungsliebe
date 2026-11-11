@@ -305,3 +305,51 @@ def test_backup_error_message_is_shown(env, monkeypatch):
     assert wait_for(lambda: api.reorganizer.state.get("phase") == "error", timeout=30)
     assert "frei sind nur" in api.reorganizer.state["error"]
     api.shutdown()
+
+
+def test_hint_changes_suggestion_and_is_remembered(env):
+    api = make_api(env)
+    text_pdf(env["inbox"] / "brief.pdf", ["Sehr geehrte Damen und Herren", "anbei die Unterlagen vom 05.10.2026",
+                                          "Ihr Bankberater"])
+    assert wait_for(lambda: api.pipeline.overview()["total"] == 1 and api.pipeline.overview()["working"] == 0)
+    item = (api.batch("inbox")["data"] or [api.next_single("inbox")["data"]])[0]
+    assert api.give_hint(item["id"], "Das gehört zur Bank")["ok"]
+    assert wait_for(lambda: api.pipeline.overview()["working"] == 0)
+    again = api.item(item["id"])["data"]
+    assert again["suggestion"]["folder"] == "Finanzen/Bank"
+    assert again["hint"] == "Das gehört zur Bank"
+    hv = api.hints_view()["data"]
+    assert hv["hints"][0]["text"] == "Das gehört zur Bank" and hv["hints"][0]["scope"] == "aehnlich"
+    # ähnliches Dokument bekommt den Hinweis automatisch mit, ein fremdes nicht
+    assert "Das gehört zur Bank" in api.hints.relevant("Sehr geehrte Damen und Herren anbei die Unterlagen Bankberater")
+    assert api.hints.relevant("Rezept Apotheke Ibuprofen 400") == []
+    # Regel für alle Dokumente
+    rule = api.hint_add_rule("Rechnungen von Amazon gehören zu Einkäufe")["data"]
+    assert "Rechnungen von Amazon gehören zu Einkäufe" in api.hints.relevant("irgendwas völlig anderes")
+    api.hint_update(rule["id"], "Amazon → Einkäufe", None)
+    api.hint_delete(rule["id"])
+    assert len(api.hints_view()["data"]["hints"]) == 1
+    api.shutdown()
+
+
+def test_not_a_document_is_never_proposed_again(env):
+    from PIL import Image
+    api = make_api(env)
+    Image.new("RGB", (1200, 900), "orange").save(env["inbox"] / "katze.jpg")
+    assert wait_for(lambda: api.pipeline.overview()["total"] == 1 and api.pipeline.overview()["working"] == 0)
+    item = (api.batch("inbox")["data"] or [api.next_single("inbox")["data"]])[0]
+    assert api.not_document(item["id"])["ok"]
+    assert (env["inbox"] / "katze.jpg").exists()  # bleibt liegen
+    import time as _t
+    _t.sleep(2)
+    assert api.pipeline.overview()["total"] == 0
+    # gleiche Datei unter anderem Namen wird ebenfalls übergangen
+    shutil.copy(env["inbox"] / "katze.jpg", env["inbox"] / "katze2.jpg")
+    _t.sleep(4)
+    assert api.pipeline.overview()["total"] == 0
+    # im Verlauf zurücknehmen → wird wieder vorgeschlagen
+    entry = next(e for d in api.history_view()["data"]["days"] for e in d["entries"] if e["action"] == "ignore")
+    assert entry["undoable"]
+    assert api.undo(entry["id"])["ok"]
+    assert wait_for(lambda: api.pipeline.overview()["total"] >= 1, timeout=20)
+    api.shutdown()

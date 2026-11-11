@@ -583,11 +583,12 @@ function drawSingle() {
   let right;
   if (c.waitingFor || it.status === "waiting" || it.status === "analyzing") {
     right = `<div class="waiting" style="padding:2rem 0"><div class="spinner"></div>
-      <h2 class="suggest-title">Ich suche einen anderen Ordner …</h2><p class="lead">Einen Moment bitte.</p></div>`;
+      <h2 class="suggest-title">${esc(c.waitMsg || "Ich suche einen anderen Ordner …")}</h2><p class="lead">Einen Moment bitte.</p></div>`;
   } else if (it.status === "error") {
     right = `<div class="stack g8"><span class="eyebrow">Hoppla</span><h1 class="suggest-title">Dieses Dokument konnte ich nicht lesen</h1></div>
       <div class="notice warn">${I.warn()}<div>${esc(it.error || "Unbekannter Fehler")}</div></div>
       <div class="stack g12 mt-auto"><button type="button" class="btn primary big" data-act="retry">Noch einmal versuchen</button>
+      <button type="button" class="btn tall" data-act="notDoc">Das ist kein Dokument (z. B. ein Foto)</button>
       <div class="row g12 wrapflex"><button type="button" class="btn tall" style="flex:2 1 15rem" data-act="manual">Selbst einen Ordner wählen</button>
       <button type="button" class="btn link tall" style="flex:1 1 8rem" data-act="skip">Später</button></div></div>`;
   } else {
@@ -611,6 +612,8 @@ function drawSingle() {
                <button type="button" class="btn small violet" data-act="editName">Ändern</button></div>`}
         </div>
       </div>
+      ${it.hint ? `<div class="small muted">Dein Hinweis: „${esc(it.hint)}“</div>` : ""}
+      ${hintBox(c)}
       <div class="stack g12 mt-auto">
         <button type="button" class="btn primary big shadow" data-act="confirm">${I.check(26, 2.6)} Passt so – einsortieren</button>
         <div class="row g12 wrapflex">
@@ -671,12 +674,63 @@ function drawSingle() {
     },
     reject: async () => {
       await tryCall("reject", it.id);
+      c.waitMsg = "Ich suche einen anderen Ordner …";
       c.waitingFor = it.id;
       drawSingle();
     },
     skip: async () => { await tryCall("skip", it.id); loadNextSingle(); },
-    retry: async () => { await tryCall("retry", it.id); c.waitingFor = it.id; drawSingle(); },
+    retry: async () => { await tryCall("retry", it.id); c.waitMsg = "Ich versuche es noch einmal …"; c.waitingFor = it.id; drawSingle(); },
+    hintToggle: () => { c.hintOpen = !c.hintOpen; drawSingle(); if (c.hintOpen) { const f = document.getElementById("hint"); if (f) f.focus(); } },
+    hintText: (el) => { c.hintText = el.value; },
+    hintChip: (el) => {
+      c.hintText = el.dataset.text;
+      drawSingle();
+      const f = document.getElementById("hint");
+      if (f) { f.focus(); f.setSelectionRange(f.value.length, f.value.length); }
+    },
+    hintSend: async (el) => {
+      const text = (c.hintText || "").trim();
+      if (!text) { toast("Schreib kurz, was ich beachten soll."); return; }
+      el.disabled = true;
+      if (await tryCall("give_hint", it.id, text)) {
+        c.hintText = ""; c.hintOpen = false;
+        c.waitMsg = "Ich schaue mir das Dokument mit deinem Hinweis noch einmal an …";
+        c.waitingFor = it.id;
+        drawSingle();
+      } else el.disabled = false;
+    },
+    notDoc: async () => {
+      if (await tryCall("not_document", it.id)) {
+        toast("Bleibt, wo es ist – ich schlage es nicht mehr vor. Im Verlauf kannst du das zurücknehmen.");
+        loadNextSingle();
+      }
+    },
   });
+}
+
+const HINT_CHIPS = [
+  ["Ist privat", "Das ist ein privates Dokument."],
+  ["Ist beruflich", "Das ist ein berufliches Dokument."],
+  ["Gehört zu …", "Das gehört zu "],
+  ["Datum stimmt nicht", "Das Datum im Dateinamen stimmt nicht – nimm das Datum, das im Dokument steht."],
+  ["Anderer Absender", "Der Absender ist eigentlich "],
+];
+
+function hintBox(c) {
+  const open = !!c.hintOpen;
+  return `<div class="disclosure ${open ? "open" : ""}">
+    <button type="button" data-act="hintToggle" aria-expanded="${open}">Hinweis für die KI ${I.chev()}</button>
+    ${open ? `<div>
+      <div class="row g8 wrapflex">
+        <button type="button" class="btn chip" data-act="notDoc">Ist ein Foto, kein Dokument</button>
+        ${HINT_CHIPS.map(([l, t]) => `<button type="button" class="btn chip" data-act="hintChip" data-text="${esc(t)}">${esc(l)}</button>`).join("")}
+      </div>
+      <label class="sr-only" for="hint">Hinweis für die KI</label>
+      <input class="text" id="hint" data-input="hintText" value="${esc(c.hintText || "")}" placeholder="z. B. „Rechnungen von Amazon gehören zu Einkäufe“" maxlength="500">
+      <div class="row between wrapflex g12"><span class="tiny muted">Ich merke mir den Hinweis auch für ähnliche Dokumente.</span>
+        <button type="button" class="btn violet" data-act="hintSend">Neuer Vorschlag mit Hinweis</button></div>
+    </div>` : ""}
+  </div>`;
 }
 
 function zoomPreview() {
@@ -798,9 +852,9 @@ function drawHistory(h) {
   const days = h.days.map((d) => `<div class="stack g10"><h2 class="h2">${esc(d.label)}</h2><ul class="hist">
     ${d.entries.map((e) => `<li><span class="time">${esc(e.time)}</span>
       <div class="stack g4 grow" style="flex-basis:18rem"><span class="name ${e.undone ? "struck" : ""}">${esc(e.name)}</span>
-      <span class="tiny muted">${e.undone ? "zurück im Scan-Eingang" : esc(e.where)}</span></div>
-      ${e.undone ? `<span class="row g8" style="color:var(--ok);font-weight:600">${I.check(20)} Zurückgelegt</span>`
-        : e.undoable ? `<button type="button" class="btn small violet" data-act="undo" data-id="${esc(e.id)}">${I.undo()} ${e.action === "trash" ? "Zurückholen" : "Rückgängig"}</button>` : ""}
+      <span class="tiny muted">${e.undone && e.action !== "ignore" ? "zurück im Scan-Ordner" : esc(e.where)}</span></div>
+      ${e.undone ? `<span class="row g8" style="color:var(--ok);font-weight:600">${I.check(20)} ${e.action === "ignore" ? "Wird wieder vorgeschlagen" : "Zurückgelegt"}</span>`
+        : e.undoable ? `<button type="button" class="btn small violet" data-act="undo" data-id="${esc(e.id)}">${I.undo()} ${e.action === "trash" ? "Zurückholen" : e.action === "ignore" ? "Doch vorschlagen" : "Rückgängig"}</button>` : ""}
     </li>`).join("")}</ul></div>`).join("");
   const reorgs = h.reorgs.map((g) => `<div class="stack g10"><h2 class="h2">${esc(g.label)} · Ablage neu geordnet${g.cancelled ? " (abgebrochen)" : ""}</h2>
     <div class="card row g20 wrapflex"><div class="icon-box">${I.layers(26)}</div>
@@ -823,7 +877,7 @@ function drawHistory(h) {
     undo: async (el) => {
       el.disabled = true;
       const r = await tryCall("undo", el.dataset.id);
-      if (r) toast("Liegt wieder im Scan-Ordner.");
+      if (r) toast(r.ignore ? "Wird wieder vorgeschlagen." : "Liegt wieder im Scan-Ordner.");
       const h2 = await tryCall("history_view");
       if (h2) drawHistory(h2);
     },
@@ -843,8 +897,33 @@ function drawHistory(h) {
 }
 
 /* ---------- Einstellungen ---------- */
+function loadHints() {
+  call("hints_view").then((h) => {
+    const box = document.getElementById("hints-card");
+    if (!box || S.route !== "settings") return;
+    const rows = h.hints.map((x) => `<div class="stack g8" style="border-top:1px solid var(--divider);padding-top:0.875rem">
+        <div class="row g8"><input class="text" value="${esc(x.text)}" data-change="hintEdit" data-id="${esc(x.id)}" aria-label="Hinweis" maxlength="500">
+          <button type="button" class="xbtn" data-act="hintDel" data-id="${esc(x.id)}" aria-label="Hinweis löschen" title="Löschen">${I.x(18)}</button></div>
+        <div class="row between wrapflex g8"><span class="tiny muted">${x.source ? "Gemerkt bei „" + esc(x.source) + "“" : "Eigene Regel"}</span>
+          <div class="row g8"><span class="tiny muted">Gilt für</span><div class="seg" role="group" style="min-width:20rem">
+            <button type="button" style="min-height:2.5rem;font-size:0.9375rem" aria-pressed="${x.scope === "aehnlich"}" data-act="hintScope" data-id="${esc(x.id)}" data-val="aehnlich">Ähnliche Dokumente</button>
+            <button type="button" style="min-height:2.5rem;font-size:0.9375rem" aria-pressed="${x.scope === "alle"}" data-act="hintScope" data-id="${esc(x.id)}" data-val="alle">Alle Dokumente</button></div></div></div>
+      </div>`).join("");
+    box.innerHTML = `<h2 style="font-size:1.3125rem">Das habe ich mir gemerkt</h2>
+      <p class="small muted">Diese Hinweise gebe ich der KI mit. Du kannst sie ändern (einfach hineinklicken) oder löschen.</p>
+      ${rows || `<p class="muted">Noch keine Hinweise. Du kannst sie in der Einzelprüfung unter „Hinweis für die KI“ geben – oder hier eine Regel anlegen.</p>`}
+      <div class="row g8 wrapflex" style="border-top:1px solid var(--divider);padding-top:1rem">
+        <input class="text grow" style="flex:1 1 20rem" data-input="ruleText" placeholder="Neue Regel, z. B. „Rechnungen von Amazon gehören zu Einkäufe“" aria-label="Neue Regel" maxlength="500">
+        <button type="button" class="btn" data-act="ruleAdd">${I.plus()} Regel hinzufügen</button></div>
+      ${h.ignored ? `<div class="row between wrapflex g12" style="border-top:1px solid var(--divider);padding-top:1rem">
+        <span>${plural(h.ignored, "Datei ist", "Dateien sind")} als „kein Dokument“ markiert und ${h.ignored === 1 ? "wird" : "werden"} nicht mehr vorgeschlagen.</span>
+        <button type="button" class="btn small" data-act="ignoredClear">Wieder vorschlagen</button></div>` : ""}`;
+  }).catch((e) => toast(e.message));
+}
+
 SCREENS.settings = () => {
   if (!S.params.fresh) { refreshState().then(() => { if (S.route === "settings") go("settings", { fresh: true }); }); }
+  setTimeout(loadHints, 0);
   const s = S.state.settings;
   const seg = (key, opts) => `<div class="seg" role="group">${opts.map(([v, l]) => `<button type="button" aria-pressed="${s[key] === v}" data-act="seg" data-key="${key}" data-val="${v}">${l}</button>`).join("")}</div>`;
   const hints = {
@@ -885,6 +964,8 @@ SCREENS.settings = () => {
           <button type="button" class="textbtn" style="align-self:flex-start" data-act="forget">Gelerntes vergessen und neu anfangen …</button>
         </section>
       </div>
+      <section class="card stack g16" id="hints-card"><h2 style="font-size:1.3125rem">Das habe ich mir gemerkt</h2>
+        <div class="waiting" style="padding:1rem"><div class="spinner small"></div></div></section>
       <p class="tiny muted">Ordnungsliebe ${esc(S.state.version)}</p>
     </main></div>`);
   S.actions = {
@@ -906,6 +987,23 @@ SCREENS.settings = () => {
     },
     models: () => modelDialog(),
     backups: () => backupsDialog(),
+    hintEdit: async (el) => {
+      const v = el.value.trim();
+      if (!v) return;
+      if (await tryCall("hint_update", el.dataset.id, v, null)) toast("Gespeichert.");
+    },
+    hintScope: async (el) => { if (await tryCall("hint_update", el.dataset.id, null, el.dataset.val)) loadHints(); },
+    hintDel: async (el) => { if (await tryCall("hint_delete", el.dataset.id)) loadHints(); },
+    ruleText: (el) => { S.ruleText = el.value; },
+    ruleAdd: async () => {
+      const v = (S.ruleText || "").trim();
+      if (!v) { toast("Bitte eine Regel eingeben."); return; }
+      if (await tryCall("hint_add_rule", v)) { S.ruleText = ""; loadHints(); toast("Regel gespeichert."); }
+    },
+    ignoredClear: async () => {
+      const ok = await confirmDialog("Wieder vorschlagen?", "Alle Dateien, die du als „kein Dokument“ markiert hast, schlage ich wieder zum Einsortieren vor.", "Ja, wieder vorschlagen");
+      if (ok && (await tryCall("ignored_clear")) !== undefined) { toast("Erledigt."); loadHints(); }
+    },
     forget: async () => {
       const ok = await confirmDialog("Gelerntes vergessen?", "Ordnungsliebe vergisst alle bisherigen Entscheidungen und schlägt wieder ohne Erfahrung vor. Deine Dokumente bleiben unverändert.", "Ja, vergessen", true);
       if (ok && await tryCall("reset_memory")) { toast("Erledigt – ich fange neu an zu lernen."); await refreshState(); render(); }

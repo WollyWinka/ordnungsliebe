@@ -16,7 +16,8 @@ Regeln:
 - "summary": ein kurzer deutscher Satz, was das Dokument ist, z. B. "Beitragsrechnung der Hausratversicherung für 2027".
 - "alternative_folder": der zweitbeste Ordner aus der Liste oder "".
 - "confidence": "sehr sicher", "ziemlich sicher" oder "unsicher". Sei ehrlich: Wenn zwei Ordner gleich gut passen, ist es "unsicher".
-- Ähnliche, vom Nutzer bereits bestätigte Fälle haben Vorrang vor deinem eigenen Gefühl."""
+- Ähnliche, vom Nutzer bereits bestätigte Fälle haben Vorrang vor deinem eigenen Gefühl.
+- Hinweise des Nutzers haben Vorrang vor allem anderen. Ein Hinweis zu genau diesem Dokument gilt für Ordner UND Dateinamen; nennt er einen Ordner, der nicht in der Liste steht, wähle "__NEU__" und trage ihn in "new_folder" ein."""
 
 
 def classify_schema(folders: list[str]) -> dict:

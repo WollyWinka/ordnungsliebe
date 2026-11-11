@@ -31,7 +31,8 @@ def output_suffix(kind: str, original: Path) -> str:
 
 def classify(ai, *, text: str, original: Path, kind: str, page_count: int,
              folders: list[str], folder_info: dict[str, dict], examples: list[dict],
-             excluded: list[str] | None = None, allow_new: bool = True) -> dict:
+             excluded: list[str] | None = None, allow_new: bool = True,
+             user_hints: list[str] | None = None, doc_hint: str = "") -> dict:
     """Schlägt Ordner, Dateinamen und Kurzbeschreibung vor.
 
     folder_info: Ordner -> {"scheme": str, "files": [Beispieldateinamen]}
@@ -58,9 +59,13 @@ def classify(ai, *, text: str, original: Path, kind: str, page_count: int,
             snippet = re.sub(r"\s+", " ", e.get("text", ""))[:300]
             ex_lines.append(f"{i}) Text: «{snippet}» → Ordner: {e['folder']}, Dateiname: {e['filename']}")
         user.append("Ähnliche, vom Nutzer bereits bestätigte Fälle:\n" + "\n".join(ex_lines))
+    if user_hints:
+        user.append("Allgemeine Hinweise des Nutzers (immer beachten):\n" + "\n".join(f"- {h}" for h in user_hints))
     if excluded:
         user.append("Der Nutzer hat diese Ordner für dieses Dokument abgelehnt, nicht verwenden: "
                     + ", ".join(excluded))
+    if doc_hint:
+        user.append(f"HINWEIS DES NUTZERS ZU GENAU DIESEM DOKUMENT (hat Vorrang vor allem anderen): {doc_hint}")
     if not allow_new:
         user.append('Wähle unbedingt einen vorhandenen Ordner, nicht "__NEU__".')
     type_label = {"pdf": "PDF", "image": "Bild/Scan", "office": "Office-Datei", "email": "E-Mail"}.get(kind, kind)
