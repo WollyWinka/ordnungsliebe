@@ -30,7 +30,49 @@ def _file_key(path: Path) -> str:
     return h.hexdigest()[:32]
 
 
-def office_to_pdf(path: Path, timeout: int = 180) -> Path | None:
+# LibreOffice-Einstellungen für das eigene, unsichtbare Profil:
+#  - LoadPrinter=false: in Dokumenten gespeicherte Drucker NICHT ansprechen
+#    (sonst erscheint „Es wird auf die Druckerverbindung gewartet …“)
+#  - keine Wiederherstellung, keine Update-Prüfung, keine Makros
+_LO_SETTINGS = [
+    ("/org.openoffice.Office.Common/Save/Document", "LoadPrinter", "false"),
+    ("/org.openoffice.Office.Recovery/AutoSave", "Enabled", "false"),
+    ("/org.openoffice.Office.Recovery/RecoveryInfo", "Enabled", "false"),
+    ("/org.openoffice.Office.Jobs/Jobs/org.openoffice.Office.Jobs:Job['UpdateCheck']/Arguments",
+     "AutoCheckEnabled", "false"),
+    ("/org.openoffice.Office.Common/Security/Scripting", "MacroSecurityLevel", "3"),
+    ("/org.openoffice.Office.Common/Misc", "FirstRun", "false"),
+]
+_XCU_HEAD = ('<?xml version="1.0" encoding="UTF-8"?>\n<oor:items xmlns:oor="http://openoffice.org/2001/registry" '
+             'xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n')
+
+
+def _prepare_lo_profile() -> None:
+    xcu = paths.lo_profile_dir() / "user" / "registrymodifications.xcu"
+    xcu.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        content = xcu.read_text(encoding="utf-8")
+    except OSError:
+        content = _XCU_HEAD + "</oor:items>\n"
+    changed = False
+    for node, prop, value in _LO_SETTINGS:
+        if value is None:
+            continue
+        item = (f'<item oor:path="{node}"><prop oor:name="{prop}" oor:op="fuse">'
+                f'<value>{value}</value></prop></item>')
+        marker = f'oor:path="{node}"><prop oor:name="{prop}"'
+        if marker in content:
+            if item not in content:
+                content = re.sub(re.escape(marker) + r'[^\n]*?</item>', item, content)
+                changed = True
+            continue
+        content = content.replace("</oor:items>", item + "\n</oor:items>")
+        changed = True
+    if changed:
+        xcu.write_text(content, encoding="utf-8")
+
+
+def office_to_pdf(path: Path, timeout: int = 90) -> Path | None:
     """Wandelt eine Office-Datei mit dem mitgelieferten LibreOffice in ein PDF um (zwischengespeichert)."""
     soffice = paths.soffice_path()
     if soffice is None:
@@ -42,6 +84,10 @@ def office_to_pdf(path: Path, timeout: int = 180) -> Path | None:
         return target
     work = out_dir / "arbeit"
     work.mkdir(exist_ok=True)
+    try:
+        _prepare_lo_profile()
+    except OSError:
+        log.warning("LibreOffice-Profil konnte nicht vorbereitet werden")
     profile = paths.lo_profile_dir().as_uri()
     cmd = [str(soffice), f"-env:UserInstallation={profile}", "--headless", "--norestore",
            "--convert-to", "pdf", "--outdir", str(work), str(path)]
