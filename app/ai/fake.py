@@ -60,19 +60,21 @@ class FakeAI:
     def _classify(self, user: str, schema: dict) -> dict:
         allowed = schema["properties"]["folder"]["enum"]
         doc = self._doc_part(user)
-        folder, doc_type, hits = None, "Dokument", 0
+        folder, doc_type, hits, new_folder = None, "Dokument", 0, ""
+        # Regeln sind von speziell nach allgemein sortiert: die erste passende gewinnt.
         for words, target, dtype in KEYWORDS:
             n = sum(doc.count(w) for w in words)
-            if n > hits:
-                candidates = [f for f in allowed if f.lower() == target.lower()] or \
-                             [f for f in allowed if f.split("/")[-1].lower() in target.lower()]
-                folder = candidates[0] if candidates else None
-                new_target = target if not candidates else ""
-                hits, doc_type = n, dtype
-                if folder is None and prompts.NEW_FOLDER in allowed:
-                    folder, new_folder = prompts.NEW_FOLDER, new_target
-                else:
-                    new_folder = ""
+            if not n:
+                continue
+            candidates = [f for f in allowed if f.lower() == target.lower()]
+            if candidates:
+                folder = candidates[0]
+            elif prompts.NEW_FOLDER in allowed:
+                folder, new_folder = prompts.NEW_FOLDER, target
+            else:
+                continue
+            hits, doc_type = n + 1, dtype
+            break
         if folder is None:
             real = [f for f in allowed if f != prompts.NEW_FOLDER]
             folder = real[0] if real else prompts.NEW_FOLDER

@@ -82,21 +82,24 @@ def classify(ai, *, text: str, original: Path, kind: str, page_count: int,
 def _postprocess(raw: dict, *, original: Path, kind: str, folders: list[str], excluded: list[str],
                  allow_new: bool, examples: list[dict]) -> dict:
     lower_map = {f.lower(): f for f in folders}
+    excluded_lower = {e.lower() for e in excluded}
     folder = str(raw.get("folder") or "")
+    alt = str(raw.get("alternative_folder") or "")
     is_new = False
-    if folder == prompts.NEW_FOLDER or folder not in folders:
+    if folder == prompts.NEW_FOLDER or folder not in folders or folder in excluded:
         candidate = naming.clean_folder(str(raw.get("new_folder") or ""))
-        if candidate.lower() in lower_map:
+        if candidate.lower() in lower_map and candidate.lower() not in excluded_lower:
             folder = lower_map[candidate.lower()]
-        elif candidate and allow_new and candidate not in excluded:
+        elif candidate and allow_new and candidate.lower() not in lower_map:
             # höchstens zwei Ebenen bei neuen Ordnern
             folder = "/".join(candidate.split("/")[:2])
             is_new = True
         else:
-            fallback = [f for f in folders if f not in excluded]
+            # Die KI wollte einen abgelehnten Ordner „neu“ anlegen → nächstbesten nehmen
+            fallback = ([alt] if alt in folders and alt not in excluded else []) + \
+                       [f for f in folders if f not in excluded]
             folder = fallback[0] if fallback else "Sonstiges"
             is_new = folder not in folders
-    alt = str(raw.get("alternative_folder") or "")
     if alt not in folders or alt == folder or alt in excluded:
         alt = ""
 
