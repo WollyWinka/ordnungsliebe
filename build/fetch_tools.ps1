@@ -23,11 +23,26 @@ function Get-File($url, $out) {
 $llamaDir = Join-Path $tools "llama"
 if (-not (Test-Path (Join-Path $llamaDir "llama-server.exe"))) {
     $zip = Join-Path $deps "llama.zip"
-    $tag = $env:LLAMA_TAG
-    if (-not $tag) { $tag = (gh release view --repo ggml-org/llama.cpp --json tagName -q .tagName) }
-    Write-Host "llama.cpp Version: $tag"
-    gh release download $tag --repo ggml-org/llama.cpp --pattern "*bin-win-vulkan-x64.zip" --output $zip --clobber
-    if (-not (Test-Path $zip)) { throw "llama.cpp-Paket nicht gefunden" }
+    # Neueste Veröffentlichung mit Windows-Paket suchen (Namensschema kann sich ändern).
+    # Bevorzugt Vulkan (NVIDIA, AMD, Intel), sonst die reine Prozessor-Fassung.
+    $releases = gh api "repos/ggml-org/llama.cpp/releases?per_page=40" | ConvertFrom-Json
+    $patterns = @('win-vulkan-x64\.zip$', 'win.*vulkan.*x64.*\.zip$', 'win-cpu-x64\.zip$', 'win.*avx2.*x64.*\.zip$')
+    $asset = $null; $tag = $null
+    if ($env:LLAMA_TAG) { $releases = $releases | Where-Object { $_.tag_name -eq $env:LLAMA_TAG } }
+    foreach ($pat in $patterns) {
+        foreach ($r in $releases) {
+            $hit = $r.assets | Where-Object { $_.name -match $pat -and $_.name -notmatch 'cudart' } | Select-Object -First 1
+            if ($hit) { $asset = $hit; $tag = $r.tag_name; break }
+        }
+        if ($asset) { break }
+    }
+    if (-not $asset) {
+        Write-Host "Windows-Pakete der letzten Veröffentlichungen:"
+        $releases | Select-Object -First 3 | ForEach-Object { Write-Host " $($_.tag_name)"; $_.assets | ForEach-Object { Write-Host "    $($_.name)" } }
+        throw "Kein passendes llama.cpp-Windows-Paket gefunden"
+    }
+    Write-Host "llama.cpp: $tag / $($asset.name)"
+    Get-File $asset.browser_download_url $zip
     $tmp = Join-Path $deps "llama-x"
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
     Expand-Archive $zip -DestinationPath $tmp
