@@ -42,13 +42,13 @@ def main() -> None:
     import webview
 
     from . import APP_NAME, paths
-    from .api import Api
+    from .api import Api, make_bridge
 
     api = Api()
     s = api.settings_store.get()
     dark = s.theme == "dunkel"
     window = webview.create_window(
-        APP_NAME, url=str(paths.ui_dir() / "index.html"), js_api=api,
+        APP_NAME, url=str(paths.ui_dir() / "index.html"), js_api=make_bridge(api),
         width=1280, height=880, min_size=(960, 680),
         background_color="#17161D" if dark else "#F6F5FA", text_select=False)
     api.set_window(window)

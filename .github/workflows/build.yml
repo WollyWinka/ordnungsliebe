@@ -1,0 +1,103 @@
+name: Setup bauen
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Abhängigkeiten
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-deu libreoffice-writer-nogui fonts-dejavu-core
+          pip install pymupdf requests python-docx openpyxl extract-msg send2trash pillow pytest
+      - name: Tests
+        run: python -m pytest -q tests
+
+  windows:
+    needs: test
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: 0.1.${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Werkzeug-Zwischenspeicher
+        uses: actions/cache@v4
+        with:
+          path: |
+            tools
+            deps
+          key: tools-v1-${{ hashFiles('build/fetch_tools.ps1') }}
+
+      - name: Werkzeuge laden (llama.cpp, Sprachdaten, LibreOffice)
+        shell: pwsh
+        run: ./build/fetch_tools.ps1
+
+      - name: Version eintragen
+        shell: pwsh
+        run: |
+          (Get-Content app/__init__.py) -replace 'APP_VERSION = ".*"', "APP_VERSION = `"$env:VERSION`"" | Set-Content app/__init__.py
+          $parts = $env:VERSION.Split('.')
+          (Get-Content build/version_info.txt) -replace '0, 1, 0, 0', "$($parts[0]), $($parts[1]), $($parts[2]), 0" -replace '"0\.1\.0"', "`"$env:VERSION`"" | Set-Content build/version_info.txt
+
+      - name: Programm bauen (PyInstaller)
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+          pyinstaller --noconfirm --distpath dist --workpath build/work build/ordnungsliebe.spec
+
+      - name: Selbsttest der gebauten Fassung
+        shell: pwsh
+        run: |
+          $env:ORDNUNGSLIEBE_TOOLS = (Resolve-Path tools).Path
+          python -c "import sys; sys.path.insert(0,'.'); from app import paths; assert paths.llama_server_path(), 'llama'; assert paths.tessdata_dir(), 'tessdata'; assert paths.soffice_path(), 'soffice'; print('Werkzeuge gefunden')"
+          & tools/llama/llama-server.exe --version
+          if (-not (Test-Path dist/Ordnungsliebe/Ordnungsliebe.exe)) { throw "exe fehlt" }
+
+      - name: Installationsdatei bauen (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & "$iscc" "/DMyAppVersion=$env:VERSION" build/installer.iss
+          Get-Item dist/Ordnungsliebe-Setup.exe | Format-List Name, Length
+
+      - name: Als Build-Ergebnis ablegen
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ordnungsliebe-Setup
+          path: dist/Ordnungsliebe-Setup.exe
+          retention-days: 14
+
+      - name: Veröffentlichen (Download-Link)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: Ordnungsliebe ${{ env.VERSION }}
+          make_latest: true
+          files: dist/Ordnungsliebe-Setup.exe
+          body: |
+            **Installation:** `Ordnungsliebe-Setup.exe` herunterladen und doppelt anklicken.
+
+            Beim ersten Start lädt Ordnungsliebe einmalig die KI herunter (je nach Computer 2–9 GB).
+            Danach läuft alles ohne Internet.

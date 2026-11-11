@@ -6,3 +6,5 @@ __pycache__/
 /tools/
 *.spec.bak
 .pytest_cache/
+/deps/
+/build/work/

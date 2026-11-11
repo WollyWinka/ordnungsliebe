@@ -75,6 +75,13 @@ def _read_pdf(doc: "pymupdf.Document") -> tuple[list[str], bool]:
     return texts, used
 
 
+def cached_text(sha: str) -> str | None:
+    data = jsonfile.load(_cache_path(sha), None)
+    if data and data.get("_v") == CACHE_VERSION:
+        return data.get("text") or ""
+    return None
+
+
 def read_document(path: Path, sha: str | None = None, use_cache: bool = True) -> DocText:
     """Liest den Text eines Dokuments. Scans werden per Texterkennung gelesen."""
     kind = file_kind(path)

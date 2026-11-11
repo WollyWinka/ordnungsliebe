@@ -40,7 +40,31 @@ def api_method(fn):
         except Exception:
             log.exception("Fehler in %s", fn.__name__)
             return {"ok": False, "error": "Da ist etwas schiefgegangen. Bitte versuche es noch einmal."}
+    wrapper._exposed = True
     return wrapper
+
+
+def make_bridge(api: "Api"):
+    """Objekt, das pywebview an JavaScript gibt: nur die freigegebenen Methoden, keine Interna.
+
+    pywebview durchsucht das übergebene Objekt samt Unterobjekten; deshalb bekommt es nicht die
+    Api selbst (mit Warteschlange, Sperren usw.), sondern diese schlanke Hülle.
+    """
+    class Bridge:
+        pass
+
+    def make(name):
+        original = getattr(Api, name)
+
+        @functools.wraps(original)
+        def method(self, *args):
+            return getattr(api, name)(*args)
+        return method
+
+    for name in dir(Api):
+        if not name.startswith("_") and getattr(getattr(Api, name), "_exposed", False):
+            setattr(Bridge, name, make(name))
+    return Bridge()
 
 
 def _day_label(ts: float) -> str:
@@ -93,6 +117,32 @@ class Api:
         spec = models.get(s.model_id)
         if s.setup_done and (spec is None or spec.installed or os.environ.get("ORDNUNGSLIEBE_FAKE_AI")):
             threading.Thread(target=self._warmup, daemon=True).start()
+        self.index_library_async()
+
+    def index_library_async(self) -> None:
+        threading.Thread(target=self._index_library, name="ablage-index", daemon=True).start()
+
+    def _index_library(self) -> None:
+        """Prüfsummen der Ablage für die Doppelten-Erkennung (Cloud-Platzhalter werden übersprungen)."""
+        from .docs import reader
+        from .store import textsim
+        lib = self.settings_store.get().library_dir
+        if not lib or not Path(lib).is_dir():
+            return
+        try:
+            for p in library.walk_documents(Path(lib), include_cloud_only=False):
+                if self.dup.known_sha(p):
+                    continue
+                try:
+                    sha = reader.file_hash(p)
+                except OSError:
+                    continue
+                text = reader.cached_text(sha)
+                self.dup.add_file(p, sha, textsim.fingerprint(text) if text else None)
+            self.dup.prune_missing()
+            self.dup.save()
+        except Exception:
+            log.exception("Ablage konnte nicht indiziert werden")
 
     def _warmup(self) -> None:
         try:
@@ -128,6 +178,8 @@ class Api:
     def save_settings(self, changes: dict):
         allowed = {"font_size", "theme", "batch_level", "inbox_dir", "library_dir", "keep_cloud_local"}
         self.settings_store.update(**{k: v for k, v in (changes or {}).items() if k in allowed})
+        if "library_dir" in (changes or {}):
+            self.index_library_async()
         bus.emit("queue", self.pipeline.overview())
         return self.settings_store.as_dict()
 
@@ -225,6 +277,7 @@ class Api:
         self.settings_store.update(inbox_dir=str(inbox_p), library_dir=str(lib_p), setup_done=True,
                                    first_run_choice=choice)
         threading.Thread(target=self._warmup, daemon=True).start()
+        self.index_library_async()
         return self.settings_store.as_dict()
 
     # --- Prüfen & Einsortieren -----------------------------------------------------------
@@ -250,8 +303,22 @@ class Api:
         return self.pipeline.next_single(origin)
 
     @api_method
+    def item(self, item_id: str):
+        return self.pipeline._public(self.pipeline.get(item_id), with_text=True)
+
+    @api_method
     def preview(self, item_id: str, page: int = 0):
         return self.pipeline.preview(item_id, page)
+
+    @api_method
+    def preview_path(self, path: str, page: int = 0):
+        """Vorschau einer bereits abgelegten Datei (nur innerhalb der Ablage)."""
+        root = Path(self.settings_store.get().library_dir).resolve()
+        p = Path(path).resolve()
+        if root not in p.parents:
+            raise ValueError("Diese Datei liegt nicht in deiner Ablage.")
+        from .docs import preview as pv
+        return pv.render_page(p, page, width=500)
 
     @api_method
     def thumbs(self, item_id: str):
