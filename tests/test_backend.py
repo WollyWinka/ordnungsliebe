@@ -258,3 +258,50 @@ def test_double_confirm_is_rejected(env):
     assert not api.confirm(item["id"])["ok"]
     assert len(list((env["lib"] / "Finanzen" / "Bank").glob("*.pdf"))) == 2
     api.shutdown()
+
+
+def test_reorg_skips_photos_and_unbackupable_files(env, monkeypatch):
+    from PIL import Image
+    api = make_api(env)
+    lib = env["lib"]
+    # Kamerafoto (mit Brennweite im EXIF) – darf nicht angefasst werden
+    photo = lib / "Urlaub.jpg"
+    img = Image.new("RGB", (1200, 900), "skyblue")
+    exif = Image.Exif()
+    exif.get_ifd(0x8769)[37386] = 50.0
+    img.save(photo, exif=exif.tobytes())
+    # Datei, die sich nicht sichern lässt (wie eine iCloud-Datei, die gerade nicht lädt)
+    stuck = lib / "Wohnen" / "Strom & Gas" / "haengt.pdf"
+    text_pdf(stuck, ["Stadtwerke", "Stromabrechnung vom 01.05.2026"])
+    import shutil as _sh
+    real_copy = _sh.copy2
+
+    def flaky(src, dst, *a, **k):
+        if str(src).endswith("haengt.pdf"):
+            raise OSError(5, "Zugriff verweigert")
+        return real_copy(src, dst, *a, **k)
+    monkeypatch.setattr("app.core.reorg.shutil.copy2", flaky)
+    monkeypatch.setattr("app.core.reorg.time.sleep", lambda s: None)
+
+    assert api.library_info(str(lib))["data"]["count"] == 2  # Foto zählt nicht
+    assert api.reorg_start("neu")["ok"]
+    assert wait_for(lambda: api.reorganizer.state.get("phase") in ("structure_review", "error"), timeout=120)
+    assert api.reorganizer.state["phase"] == "structure_review", api.reorganizer.state
+    st = api.reorg_structure()["data"]
+    assert st["skipped_count"] == 1 and st["skipped"][0]["rel"].endswith("haengt.pdf")
+    docs = [d["path"] for d in api.reorganizer.state["docs"]]
+    assert str(photo) not in docs and str(stuck) not in docs
+    api.reorg_apply(st["folders"])
+    assert wait_for(lambda: api.pipeline.overview("reorg")["working"] == 0, timeout=60)
+    srcs = {i["src"] for i in api.pipeline.items.values()}
+    assert str(stuck) not in srcs and str(photo) not in srcs
+    api.shutdown()
+
+
+def test_backup_error_message_is_shown(env, monkeypatch):
+    api = make_api(env)
+    monkeypatch.setattr("app.core.reorg.shutil.disk_usage", lambda p: type("U", (), {"free": 1000})())
+    api.reorg_start("neu")
+    assert wait_for(lambda: api.reorganizer.state.get("phase") == "error", timeout=30)
+    assert "frei sind nur" in api.reorganizer.state["error"]
+    api.shutdown()

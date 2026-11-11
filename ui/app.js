@@ -155,7 +155,14 @@ function minutesText(n) {
   return m === 1 ? "etwa 1 Minute" : `etwa ${m} Minuten`;
 }
 
-function plural(n, one, many) { return `${n} ${n === 1 ? one : many}`; }
+function plural(n, one, many) { return `${n.toLocaleString("de-DE")} ${n === 1 ? one : many}`; }
+
+function durationText(min) {
+  if (min < 90) return min <= 1 ? "1 Minute" : `${min} Minuten`;
+  const h = Math.round(min / 60);
+  if (h < 36) return `${h} Stunden`;
+  return `${Math.round(h / 24)} Tage`;
+}
 
 function splitName(name) {
   const i = name.lastIndexOf(".");
@@ -229,6 +236,54 @@ async function pickFolder(origin, current) {
     cancel: () => closeModal(null),
   });
   draw();
+  return p;
+}
+
+
+/* Eingebaute Ordnerauswahl (funktioniert ohne das Windows-Ordnerfenster) */
+async function browseFolder(start, title, allowCreate) {
+  let cur = null;
+  const load = async (path) => {
+    let r;
+    try { r = await call("list_dir", path || ""); }
+    catch (e) { if (path) return load(""); toast(e.message); return; }
+    cur = r;
+    const box = $modal.querySelector(".fb-body");
+    if (!box) return;
+    const crumb = r.path ? esc(r.display) : "Wo liegt der Ordner?";
+    $modal.querySelector(".fb-where").innerHTML = `${r.path ? I.folder(22) : ""} <span>${crumb}</span>`;
+    const items = r.dirs.map((d) => `<li><button type="button" data-act="open" data-path="${esc(d.path)}">${I.folder(22)} <span class="grow">${esc(d.name)}</span>${I.next(18)}</button></li>`).join("");
+    box.innerHTML = (r.path ? `<li><button type="button" data-act="up">${I.prev(18)} <span class="muted">Eine Ebene zurück</span></button></li>` : "")
+      + (items || `<li class="muted small" style="padding:0.75rem 0.875rem">Hier sind keine weiteren Ordner.</li>`);
+    $modal.querySelector("[data-act=choose]").disabled = !r.path;
+    const mk = $modal.querySelector(".fb-new");
+    if (mk) mk.style.display = r.path ? "" : "none";
+  };
+  const p = openModal(`<h2>${esc(title)}</h2>
+    <p class="small muted">Klicke dich zum richtigen Ordner durch und wähle ihn dann aus.</p>
+    <div class="row g10 value fb-where" style="font-size:1.125rem"></div>
+    <ul class="folderlist fb-body" style="max-height:24rem"><li><div class="spinner small" style="margin:1rem"></div></li></ul>
+    ${allowCreate ? `<div class="row g8 fb-new"><input class="text" id="fb-name" placeholder="Neuen Ordner hier anlegen, z. B. Scans" aria-label="Name für neuen Ordner">
+      <button type="button" class="btn" data-act="mkdir">Anlegen</button></div>` : ""}
+    <div class="row between wrapflex g12"><button type="button" class="btn link small" data-act="native">Windows-Ordnerfenster öffnen</button>
+      <div class="row g12"><button type="button" class="btn" data-act="cancel">Abbrechen</button>
+      <button type="button" class="btn primary" data-act="choose" disabled>Diesen Ordner wählen</button></div></div>`, {
+    open: (el) => load(el.dataset.path),
+    up: () => load(cur && cur.parent !== null ? cur.parent : ""),
+    cancel: () => closeModal(null),
+    choose: () => { if (cur && cur.path) closeModal({ path: cur.path, display: cur.display }); },
+    mkdir: async () => {
+      const name = document.getElementById("fb-name").value.trim();
+      if (!name || !cur || !cur.path) return;
+      const r = await tryCall("make_dir", cur.path, name);
+      if (r) { document.getElementById("fb-name").value = ""; await load(r.path); toast(`Ordner „${name}“ angelegt.`); }
+    },
+    native: async () => {
+      const r = await tryCall("choose_folder", cur && cur.path ? cur.path : "");
+      if (r) closeModal(r);
+    },
+  }, true);
+  await load(start || "");
   return p;
 }
 
@@ -840,11 +895,11 @@ SCREENS.settings = () => {
       if (r) { await refreshState(); render(); }
     },
     chooseInbox: async () => {
-      const f = await tryCall("choose_folder", s.inbox_dir);
+      const f = await browseFolder(s.inbox_dir, "Welcher Ordner ist dein Scan-Ordner?", true);
       if (f) { await tryCall("save_settings", { inbox_dir: f.path }); await refreshState(); render(); }
     },
     chooseLib: async () => {
-      const f = await tryCall("choose_folder", s.library_dir);
+      const f = await browseFolder(s.library_dir, "Welcher Ordner ist deine Ablage?", false);
       if (!f) return;
       const ok = await confirmDialog("Ablage ändern?", `Neue Dokumente kommen ab jetzt nach „${f.display}“. Bereits abgelegte Dokumente bleiben, wo sie sind.`, "Ablage ändern");
       if (ok) { await tryCall("save_settings", { library_dir: f.path }); await refreshState(); render(); }
@@ -1062,7 +1117,7 @@ SCREENS.setup = () => {
         <button type="button" class="btn primary" data-act="next" ${inbox ? "" : "disabled"}>Weiter ${I.right()}</button></div></section>`;
     Object.assign(S.actions, {
       choose: async () => {
-        const r = await tryCall("choose_folder", inbox ? inbox.path : "");
+        const r = await browseFolder(inbox && inbox.exists ? inbox.path : "", "Welcher Ordner ist dein Scan-Ordner?", true);
         if (r) { const info = await tryCall("inbox_info", r.path); st.inbox = { path: r.path, display: r.display, count: info ? info.count : 0, exists: true }; render(); }
       },
       help: () => { st.helpOpen = !st.helpOpen; render(); },
@@ -1102,7 +1157,7 @@ SCREENS.setup = () => {
     Object.assign(S.actions, {
       pickRoot: (el) => { const o = opts.find((x) => x.id === el.dataset.path); st.lib = { path: o.id, display: o.sub }; st.libInfo = null; loadLibInfo(); render(); },
       chooseLib: async () => {
-        const r = await tryCall("choose_folder", st.lib ? st.lib.path : "");
+        const r = await browseFolder(st.lib ? st.lib.path : "", "Welcher Ordner ist deine Ablage?", false);
         if (r) { st.lib = { path: r.path, display: r.display }; st.libInfo = null; loadLibInfo(); render(); }
       },
       keepLocal: (el) => { st.keepLocal = el.checked; },
@@ -1192,8 +1247,12 @@ function drawReorgIntro(r) {
     setHTML(`<div class="screen">${topbar("Zur Startseite", "back", "Ablage neu ordnen")}
       <main class="wrap narrow">
         <div class="stack g10"><h1 class="title">Ablage neu ordnen</h1>
-        <p class="lead">${li && li.ok ? `In „${esc(li.display)}“ liegen ${plural(li.count, "Dokument", "Dokumente")}.` : ""} Ich lese alle Dokumente, schlage dir eine übersichtliche Ordnung vor – und du entscheidest.</p></div>
-        ${r.phase === "error" ? `<div class="notice warn">${I.warn()}<div><b>Beim letzten Versuch ist etwas schiefgegangen.</b>${esc(r.error || "")}</div></div>` : ""}
+        <p class="lead">${li && li.ok ? `In „${esc(li.display)}“ liegen ${plural(li.count, "Dokument", "Dokumente")}${li.too_many ? "" : ` – das Einlesen dauert etwa ${durationText(li.minutes)}`}.` : ""} Ich lese alle Dokumente, schlage dir eine übersichtliche Ordnung vor – und du entscheidest. Fotos lasse ich dabei in Ruhe.</p></div>
+        ${r.phase === "error" ? `<div class="notice warn">${I.warn()}<div><b>Beim letzten Versuch ist etwas schiefgegangen.</b>${esc(r.error || "")}
+          ${r.detail ? `<div class="tiny" style="margin-top:0.5rem;opacity:0.8">Technischer Hinweis: ${esc(r.detail)}</div>` : ""}</div></div>` : ""}
+        ${li && li.too_many ? `<div class="notice warn">${I.warn()}<div class="stack g10"><span><b>Das sind sehr viele Dokumente.</b>
+          Alle zu lesen und einzuordnen dauert etwa ${durationText(li.minutes)}. Tipp: Wähle als Ablage nur den Ordner, in dem deine Papiere liegen – zum Beispiel „iCloud Drive › Dokumente“.</span>
+          <button type="button" class="btn small" style="align-self:flex-start" data-act="changeLib">Ablage-Ordner ändern</button></div></div>` : ""}
         ${li && li.cloud_only ? `<div class="notice warn">${I.cloud()}<div class="stack g10"><span>${plural(li.cloud_only, "Datei liegt", "Dateien liegen")} nur in der Cloud. Damit ich sie lesen kann, lade ich sie vorher herunter (etwa ${li.cloud_mb} MB).</span>
           <button type="button" class="btn small" style="align-self:flex-start" data-act="keepLocal">Jetzt herunterladen</button><span class="small" id="keeplocal-progress"></span></div></div>` : ""}
         <div class="stack g12" role="radiogroup" aria-label="Art der Neuordnung">
@@ -1208,6 +1267,12 @@ function drawReorgIntro(r) {
     S.actions = {
       back: () => go("home"),
       mode: (el) => { S.reorgMode = el.dataset.id; drawReorgIntro(r); },
+      changeLib: async () => {
+        const f = await browseFolder(S.state.settings.library_dir, "Welcher Ordner soll neu geordnet werden?", false);
+        if (!f) return;
+        const res = await tryCall("save_settings", { library_dir: f.path });
+        if (res) { await refreshState(); toast(`Ablage ist jetzt „${f.display}“.`); drawReorgIntro(S.state.reorg || {}); }
+      },
       keepLocal: async (el) => { el.disabled = true; await tryCall("keep_local", S.state.settings.library_dir); },
       start: async (el) => {
         el.disabled = true;
@@ -1236,7 +1301,8 @@ function drawReorgProgress(r) {
       <section class="card big stack g24">
         <ul class="phase-list">${list}</ul>
         <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div style="width:${pct}%"></div></div>
-        ${r.detail && r.phase === "reading" ? `<span class="small muted" style="overflow-wrap:anywhere">${esc(r.detail)}</span>` : ""}
+        ${r.detail && (r.phase === "reading" || r.phase === "backup") ? `<span class="small muted" style="overflow-wrap:anywhere">${esc(r.detail)}</span>` : ""}
+        ${r.phase === "backup" ? `<span class="small muted">Dateien, die nur in der iCloud liegen, lade ich dabei herunter – das kann etwas dauern.</span>` : ""}
       </section>
       <div><button type="button" class="btn" data-act="cancel">Abbrechen</button></div>
     </main></div>`);
@@ -1276,7 +1342,7 @@ function drawStructure() {
   if (!S.struct) {
     setHTML(`<div class="screen">${topbar("Zur Startseite", "back", "Ablage neu ordnen")}<div class="waiting"><div class="spinner"></div></div></div>`);
     S.actions = { back: () => go("home") };
-    call("reorg_structure").then((d) => { S.struct = { tops: structToTree(d.folders), showEx: true, count: d.doc_count, backup: d.backup }; if (S.route === "reorg") render(); })
+    call("reorg_structure").then((d) => { S.struct = { tops: structToTree(d.folders), showEx: true, count: d.doc_count, backup: d.backup, skipped: d.skipped || [], skippedCount: d.skipped_count || 0 }; if (S.route === "reorg") render(); })
       .catch((e) => toast(e.message));
     return;
   }
@@ -1299,6 +1365,8 @@ function drawStructure() {
         <p class="lead">Klicke auf einen Ordnernamen, um ihn zu ändern. Noch wird nichts verschoben.</p></div>
         <div class="notice ok" style="padding:0.75rem 1rem;align-items:center">${I.shield()}<span style="font-weight:600">Sicherung erstellt – alles lässt sich wiederherstellen</span></div>
       </div>
+      ${st.skippedCount ? `<div class="notice warn">${I.cloud()}<div><b>${plural(st.skippedCount, "Datei konnte", "Dateien konnten")} nicht gesichert oder gelesen werden.</b>
+        Diese bleiben genau, wo sie sind – ich fasse sie nicht an.${st.skipped.length ? `<div class="tiny" style="margin-top:0.375rem">z. B. ${st.skipped.slice(0, 3).map((x) => esc(x.rel.split("/").pop()) + " (" + esc(x.reason) + ")").join(", ")}</div>` : ""}</div></div>` : ""}
       <button type="button" class="switch" aria-pressed="${st.showEx}" data-act="toggleEx"><span class="track"><span class="knob"></span></span>Beispiel-Dateinamen anzeigen</button>
       <div class="foldergrid">${cards}</div>
       <div class="row between wrapflex g12" style="margin-top:auto;padding-top:0.5rem">

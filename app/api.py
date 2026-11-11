@@ -119,8 +119,10 @@ class Api:
         self._started = True
         try:
             library.purge_quarantine(30)
+            if self.reorganizer.state.get("phase") not in ("backup",):
+                self.backups.purge_orphans()
         except Exception:
-            log.exception("Papierkorb konnte nicht aufgeräumt werden")
+            log.exception("Aufräumen beim Start fehlgeschlagen")
         self.pipeline.start()
         s = self.settings_store.get()
         spec = models.get(s.model_id)
@@ -212,6 +214,27 @@ class Api:
             return None
         folder = result[0] if isinstance(result, (list, tuple)) else result
         return {"path": folder, "display": setup.pretty_path(folder)}
+
+    @api_method
+    def list_dir(self, path: str = ""):
+        """Für die eingebaute Ordnerauswahl: Unterordner eines Ordners (leer = Startpunkte)."""
+        if not path:
+            return {"path": "", "display": "", "parent": None, "dirs": library.start_places()}
+        p = Path(path)
+        if not p.is_dir():
+            raise FileNotFoundError("Diesen Ordner gibt es nicht (mehr).")
+        parent = str(p.parent) if p.parent != p else ""
+        return {"path": str(p), "display": setup.pretty_path(str(p)), "parent": parent,
+                "dirs": [{"name": d.name, "path": str(d)} for d in library.subfolders(p)]}
+
+    @api_method
+    def make_dir(self, parent: str, name: str):
+        clean = naming.clean_part(name, "")
+        if not clean:
+            raise ValueError("Bitte einen Namen eingeben.")
+        target = Path(parent) / clean
+        target.mkdir(parents=False, exist_ok=True)
+        return {"path": str(target), "display": setup.pretty_path(str(target))}
 
     @api_method
     def open_folder(self, path: str):

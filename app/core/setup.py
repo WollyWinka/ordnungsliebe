@@ -188,7 +188,10 @@ def library_info(folder: str) -> dict:
     p = Path(folder)
     if not p.is_dir():
         return {"ok": False}
-    count = sum(1 for _ in library.walk_documents(p))
+    count = sum(1 for _ in library.walk_documents(p, skip_photos=True))
     cloud_count, cloud_bytes = library.cloud_only_files(p)
+    from .reorg import SECONDS_PER_DOC, TOO_MANY
+    hours = count * SECONDS_PER_DOC / 3600
     return {"ok": True, "count": count, "cloud_only": cloud_count, "cloud_mb": round(cloud_bytes / 1e6),
-            "display": pretty_path(folder)}
+            "display": pretty_path(folder), "too_many": count > TOO_MANY,
+            "hours": round(hours, 1), "minutes": max(1, round(count * SECONDS_PER_DOC / 60))}

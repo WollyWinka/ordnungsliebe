@@ -39,19 +39,64 @@ def is_cloud_only(path: Path) -> bool:
     return bool(attrs & CLOUD_ONLY_MASK)
 
 
-def walk_documents(root: Path, include_cloud_only: bool = True):
-    """Alle unterstützten Dokumente unterhalb von root (ohne versteckte Ordner)."""
+# EXIF-Merkmale, die nur Kameras schreiben (Belichtungszeit, Brennweite, Blende, ISO)
+_CAMERA_TAGS = (33434, 37386, 33437, 34855)
+
+
+def is_photo(path: Path) -> bool:
+    """True für Kamerafotos und kleine Bilder (Symbole). Gescannte Dokumente sind keine Fotos.
+
+    Bilder, die nur in der Cloud liegen, werden nicht geöffnet (das würde sie herunterladen)
+    und vorsichtshalber wie Fotos behandelt, also nicht angefasst.
+    """
+    if reader.file_kind(path) != "image":
+        return False
+    if is_cloud_only(path):
+        return True
+    try:
+        from PIL import Image
+        with Image.open(path) as img:
+            if min(img.size) < 500:
+                return True
+            exif = img.getexif()
+            sub = exif.get_ifd(0x8769) if exif else {}
+            return any(t in sub or t in exif for t in _CAMERA_TAGS)
+    except Exception:
+        return False
+
+
+def walk_documents(root: Path, include_cloud_only: bool = True, skip_photos: bool = False):
+    """Alle unterstützten Dokumente unterhalb von root (ohne versteckte Ordner).
+
+    skip_photos: Kamerafotos auslassen (für Neuordnung und Zählung der Ablage).
+    """
     if not root.exists():
         return
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in SKIP_DIRS]
+        dirnames[:] = [d for d in dirnames if not d.startswith((".", "$")) and d not in SKIP_DIRS]
         for fn in filenames:
             p = Path(dirpath) / fn
             if fn.startswith((".", "~$")) or reader.file_kind(p) is None:
                 continue
             if not include_cloud_only and is_cloud_only(p):
                 continue
+            if skip_photos and is_photo(p):
+                continue
             yield p
+
+
+def long_path(p: Path) -> str:
+    """Windows-Pfad mit Langpfad-Präfix, damit auch Pfade über 260 Zeichen funktionieren."""
+    s = str(Path(p).absolute())
+    if not paths.IS_WINDOWS or s.startswith("\\\\?\\"):
+        return s
+    if s.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + s[2:]
+    return "\\\\?\\" + s
+
+
+# Windows-Fehlernummern der Cloud-Dateien-Schnittstelle (iCloud, OneDrive …)
+CLOUD_ERRORS = set(range(362, 400))
 
 
 def list_folders(root: Path) -> list[str]:
@@ -82,7 +127,7 @@ def folder_examples(root: Path, folder: str, limit: int = 3) -> list[str]:
 
 def folder_counts(root: Path) -> dict[str, int]:
     counts: dict[str, int] = {}
-    for p in walk_documents(root):
+    for p in walk_documents(root, skip_photos=True):
         rel = p.parent.relative_to(root)
         key = "/".join(rel.parts)
         counts[key] = counts.get(key, 0) + 1
@@ -110,10 +155,10 @@ class Schemes:
 
 
 def cloud_only_files(root: Path) -> tuple[int, int]:
-    """(Anzahl, Bytes) der Dateien, die nur in der Cloud liegen."""
+    """(Anzahl, Bytes) der Dokumente (ohne Bilder), die nur in der Cloud liegen."""
     count = size = 0
     for p in walk_documents(root):
-        if is_cloud_only(p):
+        if reader.file_kind(p) != "image" and is_cloud_only(p):
             count += 1
             try:
                 size += p.stat().st_size
@@ -130,7 +175,7 @@ def keep_local(root: Path, on_progress=None) -> int:
                            creationflags=0x08000000, timeout=120)
         except Exception:
             log.exception("attrib +P fehlgeschlagen")
-    files = [p for p in walk_documents(root) if is_cloud_only(p)]
+    files = [p for p in walk_documents(root) if reader.file_kind(p) != "image" and is_cloud_only(p)]
     for i, p in enumerate(files, 1):
         try:
             with open(p, "rb") as fh:
@@ -270,7 +315,72 @@ def known_cloud_roots() -> list[dict]:
                         docs = base / sub
                         break
                 target = docs or base
-                found.append({"id": key, "title": label, "path": str(target), "cloud": True,
+                found.append({"id": key, "title": label, "path": str(target), "base": str(base), "cloud": True,
                               "display": label + (" › " + target.name if docs else "")})
                 break
     return found
+
+
+FILE_ATTRIBUTE_HIDDEN = 0x2
+FILE_ATTRIBUTE_SYSTEM = 0x4
+
+
+def _hidden(p: Path) -> bool:
+    if p.name.startswith((".", "$", "~")) or p.name in SKIP_DIRS:
+        return True
+    if paths.IS_WINDOWS:
+        try:
+            attrs = os.stat(p, follow_symlinks=False).st_file_attributes  # type: ignore[attr-defined]
+            return bool(attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))
+        except (OSError, AttributeError):
+            return False
+    return False
+
+
+def subfolders(path: Path) -> list[Path]:
+    """Sichtbare Unterordner (für die Ordnerauswahl im Programm)."""
+    out = []
+    try:
+        for d in path.iterdir():
+            try:
+                if d.is_dir() and not _hidden(d):
+                    out.append(d)
+            except OSError:
+                continue
+    except OSError:
+        return []
+    return sorted(out, key=lambda d: d.name.lower())
+
+
+def start_places() -> list[dict]:
+    """Ausgangspunkte für die Ordnerauswahl: Cloud-Ordner, persönliche Ordner, Laufwerke."""
+    home = Path.home()
+    places, seen = [], set()
+
+    def add(title, p):
+        p = Path(p)
+        if p.is_dir() and str(p).lower() not in seen:
+            seen.add(str(p).lower())
+            places.append({"name": title, "path": str(p)})
+
+    for r in known_cloud_roots():
+        add(r["title"], r["base"])
+    for title, names in (("Dokumente", ("Documents", "Dokumente")), ("Desktop", ("Desktop",)),
+                         ("Downloads", ("Downloads",)), ("Bilder", ("Pictures", "Bilder"))):
+        for n in names:
+            if (home / n).is_dir():
+                add(title, home / n)
+                break
+    add("Persönlicher Ordner", home)
+    if paths.IS_WINDOWS:
+        import string
+        for letter in string.ascii_uppercase:
+            drive = Path(f"{letter}:/")
+            try:
+                if drive.exists():
+                    add(f"Laufwerk {letter}:", drive)
+            except OSError:
+                continue
+    else:
+        add("Computer", Path("/"))
+    return places

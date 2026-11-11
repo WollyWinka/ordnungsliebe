@@ -22,6 +22,13 @@ from . import library, naming
 
 log = logging.getLogger(__name__)
 
+TOO_MANY = 3000          # ab hier warnt die Oberfläche vor sehr langer Laufzeit
+SECONDS_PER_DOC = 5      # grobe Schätzung: Lesen + Einordnen auf einer guten Grafikkarte
+
+
+class ReorgError(RuntimeError):
+    """Fehler mit verständlicher Meldung für den Nutzer."""
+
 
 class Backups:
     def __init__(self, path: Path | None = None):
@@ -39,6 +46,17 @@ class Backups:
             b["exists"] = Path(b["path"]).exists()
             out.append(b)
         return out
+
+    def purge_orphans(self, busy_path: str = "") -> int:
+        """Entfernt halbfertige Sicherungen früherer, abgebrochener Versuche (nicht in der Liste)."""
+        known = {str(Path(b["path"])) for b in self.items}
+        removed = 0
+        root = paths.backups_dir()
+        for d in root.iterdir():
+            if d.is_dir() and str(d) not in known and str(d) != busy_path and time.time() - d.stat().st_mtime > 3600:
+                shutil.rmtree(library.long_path(d), ignore_errors=True)
+                removed += 1
+        return removed
 
     def remove(self, backup_id: str) -> bool:
         rec = next((b for b in self.items if b["id"] == backup_id), None)
@@ -98,7 +116,8 @@ class Reorganizer:
         self.bus.emit("reorg", self.status())
 
     def status(self) -> dict:
-        st = {k: v for k, v in self.state.items() if k not in ("docs",)}
+        st = {k: v for k, v in self.state.items() if k not in ("docs", "backed_up", "skipped")}
+        st["skipped_count"] = len(self.state.get("skipped", []))
         if st.get("phase") == "review":
             ov = self.pipeline.overview("reorg")
             st["pending"] = ov["total"]
@@ -140,41 +159,90 @@ class Reorganizer:
             if self._cancel.is_set():
                 return self._progress("cancelled")
             self._build_structure(docs)
-        except (LLMError, OcrUnavailable) as exc:
+        except (LLMError, OcrUnavailable, ReorgError) as exc:
+            log.warning("Neuordnung abgebrochen: %s", exc)
             self.state["error"] = str(exc)
-            self._progress("error", detail=str(exc))
+            self._progress("error", detail="")
         except Exception as exc:
             log.exception("Neuordnung fehlgeschlagen")
             self.state["error"] = "Bei der Neuordnung ist ein Fehler aufgetreten. Deine Dateien sind unverändert."
-            self._progress("error", detail=str(exc))
+            self._progress("error", detail=f"{type(exc).__name__}: {exc}"[:300])
+
+    def _copy_with_retry(self, src: Path, dst: Path) -> str:
+        """Kopiert eine Datei; bei Cloud-Dateien mit Wartezeit für den Download. Gibt "" oder den Grund zurück."""
+        last = ""
+        for attempt in range(4):
+            try:
+                os.makedirs(library.long_path(dst.parent), exist_ok=True)
+                shutil.copy2(library.long_path(src), library.long_path(dst))
+                if os.path.getsize(library.long_path(dst)) != os.path.getsize(library.long_path(src)):
+                    raise OSError("Kopie unvollständig")
+                return ""
+            except FileNotFoundError:
+                return "nicht mehr vorhanden"
+            except OSError as exc:
+                cloud = getattr(exc, "winerror", None) in library.CLOUD_ERRORS
+                last = "konnte nicht aus der Cloud geladen werden" if cloud else (exc.strerror or str(exc))
+                if self._cancel.is_set():
+                    break
+                time.sleep(2 + attempt * 4)
+        return last
 
     def _backup(self) -> None:
+        """Sichert genau die Dokumente, die die Neuordnung anfassen darf – Datei für Datei.
+
+        Dateien, die sich nicht sichern lassen (z. B. weil iCloud sie gerade nicht liefert),
+        werden übersprungen und später NICHT verschoben.
+        """
         root = self.root
-        count, size = dir_size(root)
+        self._progress("backup", 0, 0, "Ich suche deine Dokumente …")
+        files = list(library.walk_documents(root, skip_photos=True))
+        if not files:
+            raise ReorgError("In deiner Ablage habe ich keine Dokumente gefunden.")
+        size = 0
+        for p in files:
+            try:
+                size += p.stat().st_size
+            except OSError:
+                pass
         free = shutil.disk_usage(paths.backups_dir()).free
-        if free < size * 1.1 + 200 * 1024 * 1024:
-            raise RuntimeError("Für die Sicherung ist nicht genug Platz auf dem Computer frei.")
-        self._progress("backup", 0, count)
+        need = size * 1.05 + 300 * 1024 * 1024
+        if free < need:
+            raise ReorgError(
+                f"Für die Sicherung werden etwa {need / 1e9:.1f} GB gebraucht, frei sind nur "
+                f"{free / 1e9:.1f} GB. Bitte mach Platz frei oder wähle als Ablage einen kleineren Ordner."
+                .replace(".", ",", 2))
         stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         target = paths.backups_dir() / f"{stamp} {root.name} {self.state['group'][:4]}"
-        copied = [0]
-
-        def copy(src, dst):
-            shutil.copy2(src, dst)
-            copied[0] += 1
-            if copied[0] % 10 == 0:
-                self._progress("backup", copied[0], count)
-
-        shutil.copytree(root, target, copy_function=copy)
-        rec = {"id": self.state["group"], "ts": time.time(), "path": str(target), "count": count,
-               "size": size, "library": str(root)}
+        target.mkdir(parents=True, exist_ok=False)
+        saved, skipped = [], []
+        for i, p in enumerate(files, 1):
+            if self._cancel.is_set():
+                break
+            if i % 5 == 1 or i == len(files):
+                self._progress("backup", i - 1, len(files), p.name)
+            rel = p.relative_to(root)
+            reason = self._copy_with_retry(p, target / rel)
+            if reason:
+                log.warning("Nicht gesichert: %s (%s)", p, reason)
+                skipped.append({"rel": "/".join(rel.parts), "reason": reason})
+            else:
+                saved.append(str(p))
+        if not saved:
+            hint = " Läuft iCloud für Windows und bist du angemeldet?" if any(
+                "Cloud" in x["reason"] for x in skipped) else ""
+            raise ReorgError("Keine einzige Datei ließ sich sichern. Deshalb verändere ich nichts." + hint)
+        rec = {"id": self.state["group"], "ts": time.time(), "path": str(target), "count": len(saved),
+               "size": size, "library": str(root), "skipped": len(skipped)}
         self.backups.add(rec)
         self.state["backup"] = rec
-        self._progress("backup", count, count)
+        self.state["backed_up"] = saved
+        self.state["skipped"] = skipped
+        self._progress("backup", len(files), len(files))
 
     def _read_all(self) -> list[dict]:
         root = self.root
-        files = list(library.walk_documents(root))
+        files = [Path(p) for p in self.state.get("backed_up", [])]  # nur gesicherte Dateien
         docs = []
         for i, p in enumerate(files, 1):
             if self._cancel.is_set():
@@ -191,8 +259,13 @@ class Reorganizer:
                 raise
             except Exception:
                 log.exception("Konnte %s nicht lesen", p)
+                self.state.setdefault("skipped", []).append(
+                    {"rel": "/".join(p.relative_to(root).parts), "reason": "konnte nicht gelesen werden"})
+            if i % 50 == 0:
+                self.dup.save()
         self.dup.save()
         self.state["docs"] = [{"path": d["path"], "rel": d["rel"], "sha": d["sha"]} for d in docs]
+        self.state.pop("backed_up", None)
         self._progress("reading", len(files), len(files))
         return docs
 
@@ -211,8 +284,10 @@ class Reorganizer:
 
     # --- Struktur prüfen ----------------------------------------------------------
     def get_structure(self) -> dict:
+        skipped = self.state.get("skipped", [])
         return {"folders": self.state.get("structure", []), "doc_count": self.state.get("doc_count", 0),
-                "backup": self.state.get("backup")}
+                "backup": self.state.get("backup"), "skipped_count": len(skipped),
+                "skipped": skipped[:8]}
 
     def apply_structure(self, folders: list[dict]) -> dict:
         folders = tasks.clean_structure(folders)
