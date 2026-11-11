@@ -722,13 +722,13 @@ function drawDuplicate() {
       <div class="footbar" style="flex-direction:column;align-items:stretch">
         <div class="row between g12 wrapflex"><span style="font-size:1.125rem;font-weight:600">Was soll mit dem neuen Scan passieren?</span>
           <div class="row g12 wrapflex"><button type="button" class="btn tall" data-act="keep">Trotzdem ablegen</button>
-          <button type="button" class="btn primary tall" data-act="trash">${I.trash()} In den Papierkorb</button></div></div>
-        <span class="small muted">Aus dem Windows-Papierkorb kannst du den Scan jederzeit wiederherstellen.</span></div>
+          <button type="button" class="btn primary tall" data-act="trash">${I.trash()} Zur Seite legen</button></div></div>
+        <span class="small muted">Ich bewahre den Scan noch 30 Tage auf. Im Verlauf kannst du ihn jederzeit zurückholen.</span></div>
     </main></div>`);
   S.actions = {
     back: backFn,
     keep: async () => { await tryCall("dup_keep", it.id); c.waitingFor = it.id; c.item.stage = "doc"; c.item.status = "waiting"; c.preview = null; drawSingle(); loadPreview(); },
-    trash: async () => { if (await tryCall("dup_trash", it.id)) toast("In den Papierkorb gelegt."); loadNextSingle(); },
+    trash: async () => { if (await tryCall("dup_trash", it.id)) toast("Zur Seite gelegt – im Verlauf kannst du ihn zurückholen."); loadNextSingle(); },
   };
 }
 
@@ -745,12 +745,14 @@ function drawHistory(h) {
       <div class="stack g4 grow" style="flex-basis:18rem"><span class="name ${e.undone ? "struck" : ""}">${esc(e.name)}</span>
       <span class="tiny muted">${e.undone ? "zurück im Scan-Eingang" : esc(e.where)}</span></div>
       ${e.undone ? `<span class="row g8" style="color:var(--ok);font-weight:600">${I.check(20)} Zurückgelegt</span>`
-        : e.undoable ? `<button type="button" class="btn small violet" data-act="undo" data-id="${esc(e.id)}">${I.undo()} Rückgängig</button>` : ""}
+        : e.undoable ? `<button type="button" class="btn small violet" data-act="undo" data-id="${esc(e.id)}">${I.undo()} ${e.action === "trash" ? "Zurückholen" : "Rückgängig"}</button>` : ""}
     </li>`).join("")}</ul></div>`).join("");
-  const reorgs = h.reorgs.map((g) => `<div class="stack g10"><h2 class="h2">${esc(g.label)} · Ablage neu geordnet</h2>
+  const reorgs = h.reorgs.map((g) => `<div class="stack g10"><h2 class="h2">${esc(g.label)} · Ablage neu geordnet${g.cancelled ? " (abgebrochen)" : ""}</h2>
     <div class="card row g20 wrapflex"><div class="icon-box">${I.layers(26)}</div>
       <div class="stack g4 grow" style="flex-basis:20rem"><span style="font-size:1.1875rem;font-weight:600">${plural(g.count, "Dokument", "Dokumente")} neu einsortiert</span>
-      <span class="tiny muted">${g.undone ? "Diese Neuordnung wurde rückgängig gemacht." : "Die alte Ordnung lässt sich jederzeit komplett wiederherstellen."}</span></div>
+      <span class="tiny muted">${g.undone ? "Diese Neuordnung wurde rückgängig gemacht."
+        : g.undo_failed ? `${plural(g.undo_failed, "Dokument wurde", "Dokumente wurden")} inzwischen verändert oder verschoben und blieben, wo sie sind. Du kannst es noch einmal versuchen.`
+        : "Die alte Ordnung lässt sich jederzeit komplett wiederherstellen."}</span></div>
       ${g.undone ? "" : `<button type="button" class="btn small danger" data-act="undoReorg" data-id="${esc(g.id)}">Gesamte Neuordnung rückgängig machen</button>`}
     </div></div>`).join("");
   const empty = !h.days.length && !h.reorgs.length;
@@ -766,7 +768,7 @@ function drawHistory(h) {
     undo: async (el) => {
       el.disabled = true;
       const r = await tryCall("undo", el.dataset.id);
-      if (r) toast("Liegt wieder im Scan-Eingang.");
+      if (r) toast("Liegt wieder im Scan-Ordner.");
       const h2 = await tryCall("history_view");
       if (h2) drawHistory(h2);
     },
@@ -778,7 +780,7 @@ function drawHistory(h) {
       el.disabled = true;
       el.innerHTML = `<div class="spinner small"></div> Wird zurückgesetzt …`;
       const r = await tryCall("undo_reorg", el.dataset.id);
-      if (r) toast(r.failed ? `${r.ok} zurückgesetzt, ${r.failed} nicht gefunden.` : "Die alte Ordnung ist wiederhergestellt.");
+      if (r) toast(r.failed ? `${r.ok} zurückgesetzt. ${r.failed} wurden inzwischen verändert und blieben, wo sie sind.` : "Die alte Ordnung ist wiederhergestellt.");
       const h2 = await tryCall("history_view");
       if (h2) drawHistory(h2);
     },
@@ -1105,7 +1107,11 @@ SCREENS.setup = () => {
       },
       keepLocal: (el) => { st.keepLocal = el.checked; },
       next: () => {
-        if (st.inbox && st.lib && st.inbox.path === st.lib.path) { toast("Scan-Ordner und Ablage müssen verschiedene Ordner sein."); return; }
+        if (st.inbox && st.lib) {
+          const norm = (x) => x.replace(/[\\/]+$/, "").toLowerCase() + "/";
+          const a = norm(st.inbox.path.replace(/\\/g, "/")), b = norm(st.lib.path.replace(/\\/g, "/"));
+          if (a.startsWith(b) || b.startsWith(a)) { toast("Scan-Ordner und Ablage müssen getrennte Ordner sein – keiner darf im anderen liegen."); return; }
+        }
         st.step++; render();
       },
     });
@@ -1368,7 +1374,7 @@ function drawReorgHub(r) {
       if (res) { S.state.reorg = res; S.reorgJustDone = true; render(); } else el.disabled = false;
     },
     cancel: async () => {
-      const ok = await confirmDialog("Neuordnung abbrechen?", "Bereits einsortierte Dokumente bleiben an ihrem neuen Platz – du kannst sie im Verlauf zurücksetzen. Alle anderen bleiben unverändert.", "Abbrechen", true);
+      const ok = await confirmDialog("Neuordnung abbrechen?", "Bereits einsortierte Dokumente bleiben an ihrem neuen Platz – im Verlauf kannst du sie alle zusammen zurücksetzen. Alle anderen bleiben unverändert.", "Abbrechen", true);
       if (ok) { await tryCall("reorg_cancel"); await refreshState(); go("home"); }
     },
   };

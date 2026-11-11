@@ -67,6 +67,11 @@ def make_bridge(api: "Api"):
     return Bridge()
 
 
+def _nested(a: Path, b: Path) -> bool:
+    a, b = a.resolve(), b.resolve()
+    return a == b or a.is_relative_to(b) or b.is_relative_to(a)
+
+
 def _day_label(ts: float) -> str:
     d = time.localtime(ts)
     today = time.localtime()
@@ -112,6 +117,10 @@ class Api:
         if self._started:
             return
         self._started = True
+        try:
+            library.purge_quarantine(30)
+        except Exception:
+            log.exception("Papierkorb konnte nicht aufgeräumt werden")
         self.pipeline.start()
         s = self.settings_store.get()
         spec = models.get(s.model_id)
@@ -177,6 +186,13 @@ class Api:
     @api_method
     def save_settings(self, changes: dict):
         allowed = {"font_size", "theme", "batch_level", "inbox_dir", "library_dir", "keep_cloud_local"}
+        changes = changes or {}
+        if "inbox_dir" in changes or "library_dir" in changes:
+            cur = self.settings_store.get()
+            inbox = Path(changes.get("inbox_dir", cur.inbox_dir))
+            lib = Path(changes.get("library_dir", cur.library_dir))
+            if _nested(inbox, lib):
+                raise ValueError("Scan-Ordner und Ablage müssen getrennte Ordner sein – keiner darf im anderen liegen.")
         self.settings_store.update(**{k: v for k, v in (changes or {}).items() if k in allowed})
         if "library_dir" in (changes or {}):
             self.index_library_async()
@@ -272,8 +288,8 @@ class Api:
         inbox_p, lib_p = Path(inbox), Path(library_dir)
         inbox_p.mkdir(parents=True, exist_ok=True)
         lib_p.mkdir(parents=True, exist_ok=True)
-        if inbox_p.resolve() == lib_p.resolve():
-            raise ValueError("Scan-Ordner und Ablage müssen verschiedene Ordner sein.")
+        if _nested(inbox_p, lib_p):
+            raise ValueError("Scan-Ordner und Ablage müssen getrennte Ordner sein – keiner darf im anderen liegen.")
         self.settings_store.update(inbox_dir=str(inbox_p), library_dir=str(lib_p), setup_done=True,
                                    first_run_choice=choice)
         threading.Thread(target=self._warmup, daemon=True).start()
@@ -383,19 +399,22 @@ class Api:
                 days[label] = []
                 order.append(label)
             where = {"move": "nach " + naming.display_folder(e.get("folder", "")),
-                     "trash": "doppelt – in den Papierkorb gelegt",
+                     "trash": "doppelt – zur Seite gelegt (30 Tage aufbewahrt)",
                      "split": f"in {len(e.get('info', {}).get('parts', []))} Dokumente aufgeteilt"}
+            name = e["name"] if e["action"] != "trash" else Path(e["src"]).name
             days[label].append({
                 "id": e["id"], "time": time.strftime("%H:%M", time.localtime(e["ts"])),
-                "name": e["name"], "where": where.get(e["action"], ""), "undone": e["undone"],
-                "undoable": e["action"] == "move" and not e["undone"]})
+                "name": name, "where": where.get(e["action"], ""), "undone": e["undone"],
+                "action": e["action"],
+                "undoable": e["action"] in ("move", "trash") and not e["undone"] and Path(e["dst"]).exists()})
         groups = []
         for g in sorted(self.history.groups.values(), key=lambda g: g["ts"], reverse=True):
             if not g.get("done"):
                 continue
             entries = self.history.group_entries(g["id"])
             groups.append({"id": g["id"], "label": _day_label(g["ts"]), "count": len(entries),
-                           "undone": g.get("undone", False),
+                           "undone": g.get("undone", False), "cancelled": g.get("cancelled", False),
+                           "undo_failed": g.get("undo_failed", 0),
                            "folders": len({e.get("folder") for e in entries}),
                            "has_backup": any(b["id"] == g["id"] and b["exists"] for b in self.backups.list())})
         return {"days": [{"label": d, "entries": days[d]} for d in order], "reorgs": groups}
@@ -461,6 +480,10 @@ class Api:
 
     @api_method
     def delete_backup(self, backup_id: str):
+        st = self.reorganizer.state
+        if st.get("group") == backup_id and st.get("phase") in ("backup", "reading", "structure",
+                                                                "structure_review", "review"):
+            raise ValueError("Diese Sicherung gehört zur laufenden Neuordnung und kann erst danach gelöscht werden.")
         return self.backups.remove(backup_id)
 
     @api_method

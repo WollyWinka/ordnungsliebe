@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import threading
 from pathlib import Path
@@ -21,13 +22,19 @@ def _lock_for(path: Path) -> threading.Lock:
         return _locks[key]
 
 
+def _bak(path: Path) -> Path:
+    return path.with_name(path.name + ".bak")
+
+
 def load(path: Path, default: Any) -> Any:
     with _lock_for(path):
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                return json.load(fh)
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return default
+        for candidate in (path, _bak(path)):
+            try:
+                with open(candidate, "r", encoding="utf-8") as fh:
+                    return json.load(fh)
+            except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError):
+                continue
+        return default
 
 
 def save(path: Path, data: Any) -> None:
@@ -37,6 +44,13 @@ def save(path: Path, data: Any) -> None:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(data, fh, ensure_ascii=False, indent=1)
+                fh.flush()
+                os.fsync(fh.fileno())
+            if path.exists():
+                try:
+                    shutil.copy2(path, _bak(path))
+                except OSError:
+                    pass
             os.replace(tmp, path)
         finally:
             if os.path.exists(tmp):

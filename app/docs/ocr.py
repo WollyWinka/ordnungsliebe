@@ -106,22 +106,55 @@ def image_to_pdf(image_path: Path) -> "pymupdf.Document":
     return pymupdf.open("pdf", pdf_bytes)
 
 
+def _has_signature(doc: "pymupdf.Document") -> bool:
+    try:
+        for page in doc:
+            for w in page.widgets() or []:
+                if w.field_type == pymupdf.PDF_WIDGET_TYPE_SIGNATURE:
+                    return True
+    except Exception:
+        return True  # im Zweifel nicht anfassen
+    return False
+
+
 def make_searchable_pdf(src: Path, dst: Path) -> bool:
     """Schreibt eine durchsuchbare PDF-Fassung von src nach dst.
 
-    Gibt True zurück, wenn eine neue Datei geschrieben wurde. Bei normalen (digitalen) PDFs
-    ohne Scan-Seiten wird nichts geschrieben.
+    Gibt True zurück, wenn eine neue, geprüfte Datei geschrieben wurde. Unverändert bleiben:
+    digitale PDFs (überwiegend mit Text), verschlüsselte oder signierte PDFs und
+    E-Rechnungen mit eingebetteten Dateien (z. B. ZUGFeRD).
     """
     suffix = src.suffix.lower()
     if suffix == ".pdf":
         doc = pymupdf.open(str(src))
-        if not any(page_needs_ocr(p) for p in doc):
+        try:
+            scanned = sum(1 for p in doc if page_needs_ocr(p))
+            if (doc.is_encrypted or doc.needs_pass or scanned == 0 or scanned * 2 < doc.page_count
+                    or doc.embfile_count() > 0 or _has_signature(doc)):
+                doc.close()
+                return False
+        except Exception:
             doc.close()
             return False
     else:
         doc = image_to_pdf(src)
-    add_text_layer(doc)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    doc.save(str(dst), garbage=3, deflate=True)
-    doc.close()
-    return True
+    expected = doc.page_count
+    try:
+        add_text_layer(doc)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        doc.save(str(dst), garbage=3, deflate=True)
+    finally:
+        doc.close()
+    # Ergebnis prüfen, bevor es das Original ersetzt
+    try:
+        with pymupdf.open(str(dst)) as check:
+            ok = check.page_count == expected and expected > 0
+    except Exception:
+        ok = False
+    if not ok:
+        try:
+            dst.unlink()
+        except OSError:
+            pass
+        log.warning("Durchsuchbares PDF fehlerhaft – Original bleibt unverändert")
+    return ok

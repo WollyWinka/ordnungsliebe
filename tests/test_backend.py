@@ -179,3 +179,82 @@ def test_setup_helpers(env):
     li = api.library_info(str(env["lib"]))["data"]
     assert li["count"] == 1
     assert api.app_state()["ok"]
+
+
+def test_concurrent_moves_never_overwrite(tmp_path):
+    import threading
+    from app.core import library
+    target = tmp_path / "ziel" / "gleich.pdf"
+    srcs = []
+    for i in range(20):
+        p = tmp_path / f"q{i}.pdf"
+        p.write_bytes(f"inhalt {i}".encode())
+        srcs.append(p)
+    threads = [threading.Thread(target=library.move_file, args=(p, target)) for p in srcs]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    files = list((tmp_path / "ziel").iterdir())
+    assert len(files) == 20
+    assert sorted(f.read_bytes() for f in files) == sorted(f"inhalt {i}".encode() for i in range(20))
+
+
+def test_undo_refuses_when_file_was_replaced(env):
+    api = make_api(env)
+    text_pdf(env["inbox"] / "a.pdf", ["Sparkasse", "Kontoauszug Girokonto vom 01.11.2026", "Kontoauszug"])
+    assert wait_for(lambda: api.pipeline.overview()["total"] == 1 and api.pipeline.overview()["working"] == 0)
+    item = (api.batch("inbox")["data"] or [api.next_single("inbox")["data"]])[0]
+    dst = Path(api.confirm(item["id"])["data"]["dst"])
+    entry = api.history_view()["data"]["days"][0]["entries"][0]
+    dst.write_bytes(b"ganz anderes Dokument")  # Nutzer hat die Datei ersetzt
+    r = api.undo(entry["id"])
+    assert not r["ok"] and "verändert" in r["error"]
+    assert dst.read_bytes() == b"ganz anderes Dokument"
+    api.shutdown()
+
+
+def test_nested_folders_rejected(env):
+    from app.api import Api
+    api = Api()
+    r = api.finish_setup(str(env["lib"] / "Scans"), str(env["lib"]), "direct")
+    assert not r["ok"] and "getrennte" in r["error"]
+
+
+def test_duplicate_goes_to_own_trash_and_can_be_restored(env):
+    api = make_api(env)
+    src = env["lib"] / "Finanzen" / "Bank" / "2026-09 Kontoauszug.pdf"
+    assert wait_for(lambda: api.dup.known_sha(src) is not None, timeout=20)
+    shutil.copy(src, env["inbox"] / "doppelt.pdf")
+    assert wait_for(lambda: api.pipeline.overview()["total"] == 1 and api.pipeline.overview()["working"] == 0)
+    item = api.next_single("inbox")["data"]
+    assert item["stage"] == "duplicate"
+    assert api.dup_trash(item["id"])["ok"]
+    assert not (env["inbox"] / "doppelt.pdf").exists()
+    entry = api.history_view()["data"]["days"][0]["entries"][0]
+    assert entry["undoable"]
+    api.pipeline.stop()  # Poller anhalten, damit die Datei nicht sofort neu erkannt wird
+    assert api.undo(entry["id"])["ok"]
+    assert (env["inbox"] / "doppelt.pdf").exists()
+
+
+def test_image_keeps_real_extension_if_conversion_fails(env, monkeypatch):
+    api = make_api(env)
+    from PIL import Image
+    Image.new("RGB", (400, 300), "white").save(env["inbox"] / "foto.jpg")
+    assert wait_for(lambda: api.pipeline.overview()["total"] == 1 and api.pipeline.overview()["working"] == 0)
+    item = (api.batch("inbox")["data"] or [api.next_single("inbox")["data"]])[0]
+    monkeypatch.setattr("app.docs.ocr.make_searchable_pdf", lambda s, d: (_ for _ in ()).throw(RuntimeError("x")))
+    dst = Path(api.confirm(item["id"])["data"]["dst"])
+    assert dst.suffix == ".jpg"
+    assert dst.read_bytes()[:2] == b"\xff\xd8"
+    api.shutdown()
+
+
+def test_double_confirm_is_rejected(env):
+    api = make_api(env)
+    text_pdf(env["inbox"] / "b.pdf", ["Sparkasse", "Kontoauszug Girokonto vom 02.11.2026", "Kontoauszug"])
+    assert wait_for(lambda: api.pipeline.overview()["total"] == 1 and api.pipeline.overview()["working"] == 0)
+    item = (api.batch("inbox")["data"] or [api.next_single("inbox")["data"]])[0]
+    assert api.confirm(item["id"])["ok"]
+    assert not api.confirm(item["id"])["ok"]
+    assert len(list((env["lib"] / "Finanzen" / "Bank").glob("*.pdf"))) == 2
+    api.shutdown()

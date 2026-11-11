@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import logging
 import os
 import shutil
 import subprocess
+import threading
+import time
+import uuid
 from pathlib import Path
 
 from .. import jsonfile, paths
@@ -138,11 +143,95 @@ def keep_local(root: Path, on_progress=None) -> int:
     return len(files)
 
 
+# Alle Verschiebungen laufen nacheinander – so kann keine Datei eine andere überschreiben.
+_MOVE_LOCK = threading.RLock()
+_ERROR_NOT_SAME_DEVICE = 17  # Windows
+
+
+def _sha(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def missing_parents(target: Path) -> list[Path]:
+    """Ordner, die für target erst angelegt werden müssen (von außen nach innen)."""
+    out = []
+    p = target.parent
+    while not p.exists():
+        out.append(p)
+        if p.parent == p:
+            break
+        p = p.parent
+    return list(reversed(out))
+
+
 def move_file(src: Path, dst: Path) -> Path:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst = naming.unique_path(dst)
-    shutil.move(str(src), str(dst))
-    return dst
+    """Verschiebt src nach dst, ohne jemals eine vorhandene Datei zu überschreiben.
+
+    Ist dst belegt, wird „Name (2)“ usw. gewählt. Zwischen Laufwerken wird erst kopiert,
+    die Kopie geprüft (Größe und Prüfsumme) und erst dann das Original entfernt.
+    """
+    with _MOVE_LOCK:
+        if not src.exists():
+            raise FileNotFoundError(f"Die Datei {src.name} ist nicht mehr da.")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst = naming.unique_path(dst)
+        try:
+            if dst.exists():  # Sicherheitsnetz (POSIX-rename würde überschreiben)
+                dst = naming.unique_path(dst)
+            os.rename(src, dst)
+            return dst
+        except OSError as exc:
+            cross = exc.errno == errno.EXDEV or getattr(exc, "winerror", None) == _ERROR_NOT_SAME_DEVICE
+            if not cross:
+                raise
+        tmp = dst.with_name(f".~ordnungsliebe-{uuid.uuid4().hex[:8]}.part")
+        try:
+            shutil.copy2(src, tmp)
+            if tmp.stat().st_size != src.stat().st_size or _sha(tmp) != _sha(src):
+                raise OSError("Die Kopie ist unvollständig.")
+            dst = naming.unique_path(dst)
+            os.rename(tmp, dst)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+        try:
+            os.unlink(src)
+        except OSError:
+            log.warning("Original %s konnte nach dem Kopieren nicht entfernt werden", src)
+        return dst
+
+
+def quarantine_dir() -> Path:
+    return paths.local_dir() / "Papierkorb"
+
+
+def quarantine(path: Path) -> Path:
+    """Legt eine Datei für 30 Tage in den Ordnungsliebe-Papierkorb (statt sie zu löschen)."""
+    day = time.strftime("%Y-%m-%d")
+    return move_file(path, quarantine_dir() / day / path.name)
+
+
+def purge_quarantine(days: int = 30) -> int:
+    root = quarantine_dir()
+    if not root.exists():
+        return 0
+    limit = time.time() - days * 86400
+    removed = 0
+    for d in root.iterdir():
+        try:
+            if d.is_dir() and d.stat().st_mtime < limit:
+                shutil.rmtree(d, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def remove_empty_dirs(root: Path) -> list[str]:

@@ -117,7 +117,7 @@ def main():
                 if stage.startswith("stack"):
                     page.click("text=So trennen")
                 elif stage.startswith("duplicate"):
-                    page.click("text=In den Papierkorb")
+                    page.click("text=Zur Seite legen")
                 else:
                     if i == 1:
                         page.click("text=Passt nicht – neuer Vorschlag")

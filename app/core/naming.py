@@ -18,8 +18,10 @@ def clean_part(name: str, fallback: str = "Dokument") -> str:
     name = re.sub(r"\s+", " ", name).strip(" .")
     if len(name) > MAX_NAME:
         name = name[:MAX_NAME].rstrip(" .")
-    if not name or name.upper() in _RESERVED:
+    if not name:
         name = fallback
+    if name.split(".")[0].strip().upper() in _RESERVED:
+        name = "_" + name
     return name
 
 
@@ -37,7 +39,20 @@ def clean_filename(stem: str, suffix: str) -> str:
     return clean_part(stem) + suffix.lower()
 
 
+MAX_PATH = 240
+
+
+def fit_path(target: Path) -> Path:
+    """Kürzt den Dateinamen, falls der ganze Pfad für Windows zu lang würde."""
+    total = len(str(target))
+    if total <= MAX_PATH:
+        return target
+    stem = target.stem[: max(12, len(target.stem) - (total - MAX_PATH))].rstrip(" .")
+    return target.with_name(stem + target.suffix)
+
+
 def unique_path(target: Path) -> Path:
+    target = fit_path(target)
     if not target.exists():
         return target
     stem, suffix = target.stem, target.suffix

@@ -123,6 +123,10 @@ class Reorganizer:
         self._cancel.set()
         if self.state.get("phase") in ("structure_review", "review"):
             self.pipeline.remove_origin("reorg")
+            gid = self.state.get("group", "")
+            entries = self.history.group_entries(gid)
+            if entries:  # bereits verschobene Dokumente bleiben im Verlauf rückgängig machbar
+                self.history.update_group(gid, done=True, cancelled=True, count=len(entries))
             self.state.update(phase="cancelled")
             self._save()
             self.bus.emit("reorg", self.status())
@@ -151,8 +155,8 @@ class Reorganizer:
         if free < size * 1.1 + 200 * 1024 * 1024:
             raise RuntimeError("Für die Sicherung ist nicht genug Platz auf dem Computer frei.")
         self._progress("backup", 0, count)
-        stamp = time.strftime("%Y-%m-%d_%H-%M")
-        target = paths.backups_dir() / f"{stamp} {root.name}"
+        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        target = paths.backups_dir() / f"{stamp} {root.name} {self.state['group'][:4]}"
         copied = [0]
 
         def copy(src, dst):
@@ -161,7 +165,7 @@ class Reorganizer:
             if copied[0] % 10 == 0:
                 self._progress("backup", copied[0], count)
 
-        shutil.copytree(root, target, copy_function=copy, dirs_exist_ok=True)
+        shutil.copytree(root, target, copy_function=copy)
         rec = {"id": self.state["group"], "ts": time.time(), "path": str(target), "count": count,
                "size": size, "library": str(root)}
         self.backups.add(rec)
@@ -236,7 +240,9 @@ class Reorganizer:
 
     # --- Abschluss --------------------------------------------------------------------
     def finish(self) -> dict:
-        removed = library.remove_empty_dirs(self.root)
+        group = self.history.groups.get(self.state.get("group", ""), {})
+        root = Path(group.get("library") or self.root)
+        removed = library.remove_empty_dirs(root)
         # Ordner der neuen Struktur anlegen? Nein – nur Ordner mit Inhalt bleiben bestehen.
         self.history.update_group(self.state["group"], done=True, removed_dirs=removed,
                                   count=len(self.history.group_entries(self.state["group"])))
@@ -249,26 +255,54 @@ class Reorganizer:
 
 # --- Rückgängig -----------------------------------------------------------------------
 
+def _unchanged(path: Path, entry: dict) -> bool:
+    """Liegt an path noch genau die Datei, die wir damals abgelegt haben?"""
+    info = entry.get("info", {})
+    if not path.is_file():
+        return False
+    try:
+        if info.get("dst_size") is not None and path.stat().st_size != info["dst_size"]:
+            return False
+        if info.get("dst_sha"):
+            return reader.file_hash(path) == info["dst_sha"]
+    except OSError:
+        return False
+    return True
+
+
 def undo_entry(entry: dict, settings, history, memory, dup) -> str:
-    """Macht einen Verlaufseintrag rückgängig. Gibt den neuen Ort zurück."""
+    """Macht einen Verlaufseintrag rückgängig. Gibt den neuen Ort zurück.
+
+    Vorher wird geprüft, dass am Ablageort noch genau dieselbe Datei liegt. Nichts wird gelöscht:
+    Eine umgewandelte Kopie wandert in den Ordnungsliebe-Papierkorb.
+    """
     if entry.get("undone"):
         return entry.get("src", "")
     action = entry["action"]
     dst = Path(entry["dst"]) if entry.get("dst") else None
     src = Path(entry["src"])
-    if action not in ("move", "reorg") or dst is None:
+    if action not in ("move", "reorg", "trash") or dst is None:
         raise ValueError("Diese Aktion lässt sich nicht rückgängig machen.")
     if not dst.exists():
-        raise FileNotFoundError("Die Datei liegt nicht mehr dort, wo sie einsortiert wurde.")
+        raise FileNotFoundError("Die Datei liegt nicht mehr dort, wo sie abgelegt wurde.")
+    if not _unchanged(dst, entry):
+        raise ValueError("Die Datei wurde inzwischen verändert oder ersetzt. Bitte verschiebe sie selbst.")
+    inbox = Path(settings.inbox_dir) if settings.inbox_dir else src.parent
     if action == "move":
-        inbox = Path(settings.inbox_dir) if settings.inbox_dir else src.parent
         original = Path(entry.get("info", {}).get("original") or "")
         if original.is_file():
-            back = library.move_file(original, inbox / src.name)
-            dst.unlink()
+            # erst die umgewandelte Kopie weglegen, dann das Original zurückholen
+            parked = library.quarantine(dst)
+            try:
+                back = library.move_file(original, inbox / src.name)
+            except Exception:
+                library.move_file(parked, dst)
+                raise
         else:
             back = library.move_file(dst, inbox / dst.name)
         dup.remove(dst)
+    elif action == "trash":
+        back = library.move_file(dst, inbox / src.name)
     else:
         back = library.move_file(dst, src)
         dup.move(dst, back)
@@ -279,7 +313,11 @@ def undo_entry(entry: dict, settings, history, memory, dup) -> str:
 
 
 def undo_group(gid: str, history, memory, dup) -> dict:
-    """Macht eine komplette Neuordnung rückgängig (Datei für Datei, in umgekehrter Reihenfolge)."""
+    """Macht eine komplette Neuordnung rückgängig (Datei für Datei, in umgekehrter Reihenfolge).
+
+    Dateien, die inzwischen verändert oder weiterverschoben wurden, bleiben, wo sie sind, und
+    werden als nicht zurückgesetzt gemeldet. Ein erneuter Versuch ist möglich.
+    """
     group = history.groups.get(gid) or {}
     root = Path(group.get("library", ""))
     for rel in group.get("removed_dirs", []):
@@ -288,29 +326,32 @@ def undo_group(gid: str, history, memory, dup) -> dict:
         except OSError:
             pass
     ok = failed = 0
+    created: list[str] = []
     for entry in reversed(history.group_entries(gid)):
         if entry.get("undone"):
             continue
+        dst, src = Path(entry["dst"]), Path(entry["src"])
         try:
-            dst, src = Path(entry["dst"]), Path(entry["src"])
-            if dst.exists() and dst != src:
+            if dst != src:
+                if not _unchanged(dst, entry):
+                    failed += 1
+                    continue
                 src.parent.mkdir(parents=True, exist_ok=True)
                 back = library.move_file(dst, src)
                 dup.move(dst, back)
             history.mark_undone(entry["id"])
             memory.remove_ref(entry["id"])
+            created += entry.get("info", {}).get("created_dirs", [])
             ok += 1
         except Exception:
             log.exception("Rückgängig fehlgeschlagen für %s", entry.get("dst"))
             failed += 1
     dup.save()
-    if root.exists():
-        # neu entstandene, jetzt leere Ordner entfernen – ursprünglich leere Ordner wiederherstellen
-        library.remove_empty_dirs(root)
-        for rel in group.get("removed_dirs", []):
-            try:
-                naming.folder_to_path(root, rel).mkdir(parents=True, exist_ok=True)
-            except OSError:
-                pass
-    history.update_group(gid, undone=True)
+    # nur Ordner entfernen, die die Neuordnung selbst angelegt hat – und nur, wenn sie leer sind
+    for d in sorted(set(created), key=len, reverse=True):
+        try:
+            Path(d).rmdir()
+        except OSError:
+            pass
+    history.update_group(gid, undone=failed == 0, undo_failed=failed)
     return {"ok": ok, "failed": failed}

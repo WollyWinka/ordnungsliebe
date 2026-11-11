@@ -27,15 +27,9 @@ PRIO_USER = 0      # Nutzer wartet (z. B. nach „Passt nicht“)
 PRIO_NORMAL = 5
 
 
-def _trash(path: Path) -> None:
-    try:
-        from send2trash import send2trash
-        send2trash(str(path))
-    except Exception:
-        log.exception("Papierkorb nicht verfügbar – Datei wird in einen Sicherungsordner verschoben")
-        target = paths.local_dir() / "Papierkorb"
-        target.mkdir(parents=True, exist_ok=True)
-        library.move_file(path, target / path.name)
+def _trash(path: Path) -> Path:
+    """Nie endgültig löschen: Dateien kommen 30 Tage in den Ordnungsliebe-Papierkorb."""
+    return library.quarantine(path)
 
 
 class Pipeline:
@@ -316,52 +310,99 @@ class Pipeline:
         return preview.render_thumbs(Path(self.get(item_id)["src"]))
 
     # --- Aktionen -----------------------------------------------------------------
+    def _claim(self, item_id: str) -> dict:
+        """Sperrt einen Eintrag für das Einsortieren (verhindert doppeltes Bestätigen)."""
+        with self._lock:
+            item = self.items.get(item_id)
+            if item is None:
+                raise KeyError("Dieses Dokument ist nicht mehr in der Warteschlange.")
+            if item["status"] != "ready" or item["stage"] != "doc":
+                raise ValueError("Das Dokument wird gerade noch bearbeitet. Bitte einen Moment warten.")
+            item["status"] = "moving"
+            return item
+
     def confirm(self, item_id: str, folder: str | None = None, filename: str | None = None) -> dict:
-        item = self.get(item_id)
+        item = self._claim(item_id)
+        try:
+            result = self._do_confirm(item, folder, filename)
+        except Exception:
+            with self._lock:
+                if item_id in self.items:
+                    item["status"] = "ready"
+            self._changed()
+            raise
+        with self._lock:
+            self.items.pop(item_id, None)
+        self._changed()
+        return result
+
+    def _do_confirm(self, item: dict, folder: str | None, filename: str | None) -> dict:
+        item_id = item["id"]
         s = item["suggestion"] or {}
+        if folder is None and not s.get("folder"):
+            raise ValueError("Bitte zuerst einen Ordner wählen.")
         folder = naming.clean_folder(folder if folder is not None else s.get("folder", ""))
         src = Path(item["src"])
-        suffix = tasks.output_suffix(item["kind"], src)
-        filename = naming.clean_filename(filename if filename else s.get("filename", src.name), suffix)
+        if not src.exists():
+            raise FileNotFoundError("Die Datei ist nicht mehr im Scan-Ordner.")
         root = self.library_root
-        target = naming.folder_to_path(root, folder) / filename
+        target_dir = naming.folder_to_path(root, folder)
+        stem = filename if filename else s.get("filename", src.name)
 
         if item["origin"] == "reorg":
+            target = target_dir / naming.clean_filename(stem, src.suffix)
+            created = [str(p) for p in library.missing_parents(target)]
             if target.resolve() == src.resolve():
                 dst = src
             else:
                 dst = library.move_file(src, target)
                 self.dup.move(src, dst)
-            entry = self.history.add("reorg", str(src), str(dst), folder, group=item.get("group", ""))
+            entry = self.history.add("reorg", str(src), str(dst), folder, group=item.get("group", ""),
+                                     dst_sha=item.get("sha", ""), dst_size=dst.stat().st_size,
+                                     created_dirs=created)
         else:
             converted = None
             if item["kind"] in ("pdf", "image"):
                 tmp = paths.cache_dir() / "umwandlung" / f"{item_id}.pdf"
                 try:
+                    tmp.unlink(missing_ok=True)
                     if ocr.make_searchable_pdf(src, tmp):
                         converted = tmp
                 except Exception:
                     log.exception("Durchsuchbares PDF konnte nicht erstellt werden")
+                    converted = None
+            # Endung passend zum tatsächlichen Inhalt (bei misslungener Umwandlung bleibt das Bild ein Bild)
+            suffix = ".pdf" if converted is not None or item["kind"] == "pdf" else src.suffix.lower()
+            target = target_dir / naming.clean_filename(stem, suffix)
+            created = [str(p) for p in library.missing_parents(target)]
+            original_store = None
             if converted is not None:
                 dst = library.move_file(converted, target)
-                original_store = paths.local_dir() / "Originale" / f"{item_id}{src.suffix.lower()}"
-                library.move_file(src, original_store)
+                try:
+                    original_store = library.move_file(
+                        src, paths.local_dir() / "Originale" / f"{item_id}{src.suffix.lower()}")
+                except Exception:
+                    # Original lässt sich nicht weglegen (z. B. gesperrt): umgewandelte Kopie zurücknehmen
+                    try:
+                        dst.unlink()
+                    except OSError:
+                        pass
+                    raise RuntimeError("Die Datei ist gerade von einem anderen Programm geöffnet. "
+                                       "Bitte schließe es und versuche es noch einmal.")
             else:
                 dst = library.move_file(src, target)
-                original_store = None
+            dst_sha = reader.file_hash(dst)
             entry = self.history.add("move", str(src), str(dst), folder,
-                                     original=str(original_store) if original_store else "")
+                                     original=str(original_store) if original_store else "",
+                                     dst_sha=dst_sha, dst_size=dst.stat().st_size, created_dirs=created)
             try:
-                self.dup.add_file(dst, reader.file_hash(dst), item.get("fingerprint"))
+                self.dup.add_file(dst, dst_sha, item.get("fingerprint"))
                 self.dup.save()
             except OSError:
                 pass
         self.memory.add(item.get("text", ""), folder, dst.name, ref=entry["id"], original_name=src.name)
         if s and s.get("is_new_folder") and s.get("folder") == folder:
             self.schemes.set_one(root, folder, "JJJJ-MM Dokumentart", dst.stem)
-        with self._lock:
-            self.items.pop(item_id, None)
-        self._changed()
         return {"dst": str(dst), "folder_display": naming.display_folder(folder), "name": dst.name}
 
     def confirm_batch(self, item_ids: list[str]) -> int:
@@ -384,6 +425,8 @@ class Pipeline:
 
     def reject(self, item_id: str) -> None:
         item = self.get(item_id)
+        if item["status"] not in ("ready", "error"):
+            raise ValueError("Das Dokument wird gerade bearbeitet.")
         s = item.get("suggestion") or {}
         if s.get("folder") and s["folder"] not in item["excluded"]:
             item["excluded"].append(s["folder"])
@@ -409,10 +452,19 @@ class Pipeline:
         self._changed()
 
     def trash_duplicate(self, item_id: str) -> None:
-        item = self.get(item_id)
+        with self._lock:
+            item = self.items.get(item_id)
+            if item is None or item["status"] != "ready" or item["stage"] != "duplicate":
+                raise ValueError("Das Dokument wird gerade bearbeitet.")
+            item["status"] = "moving"
         src = Path(item["src"])
-        _trash(src)
-        self.history.add("trash", str(src), "", "", reason="doppelt")
+        try:
+            kept = _trash(src)
+        except Exception:
+            item["status"] = "ready"
+            raise
+        self.history.add("trash", str(src), str(kept), "", reason="doppelt",
+                         dst_sha=item.get("sha", ""), dst_size=kept.stat().st_size)
         with self._lock:
             self.items.pop(item_id, None)
         self._changed()
@@ -425,32 +477,50 @@ class Pipeline:
 
     def split(self, item_id: str, starts: list[int]) -> int:
         """Teilt eine Scan-Datei an den Startseiten auf. Die Teile landen im Scan-Ordner."""
-        item = self.get(item_id)
-        src = Path(item["src"])
-        if item["kind"] == "image":
-            doc = ocr.image_to_pdf(src)
-        else:
-            doc = pymupdf.open(str(src))
-        n = doc.page_count
-        starts = sorted({s for s in starts if 1 <= s <= n} | {1})
-        bounds = starts + [n + 1]
+        with self._lock:
+            item = self.items.get(item_id)
+            if item is None or item["status"] != "ready" or item["stage"] != "stack":
+                raise ValueError("Das Dokument wird gerade bearbeitet.")
+            item["status"] = "moving"
+        try:
+            src = Path(item["src"])
+            doc = ocr.image_to_pdf(src) if item["kind"] == "image" else pymupdf.open(str(src))
+            n = doc.page_count
+            starts = sorted({s for s in starts if 1 <= s <= n} | {1})
+            bounds = starts + [n + 1]
+            work = paths.cache_dir() / "trennen" / item_id
+            work.mkdir(parents=True, exist_ok=True)
+            built = []
+            for k in range(len(starts)):
+                part = pymupdf.open()
+                part.insert_pdf(doc, from_page=bounds[k] - 1, to_page=bounds[k + 1] - 2)
+                tmp = work / f"{src.stem} – Teil {k + 1}.pdf"
+                part.save(str(tmp), garbage=3, deflate=True)
+                part.close()
+                built.append(tmp)
+            doc.close()
+            # Prüfen: Zusammen müssen die Teile genau alle Seiten enthalten
+            total = 0
+            for b in built:
+                with pymupdf.open(str(b)) as d:
+                    total += d.page_count
+            if total != n:
+                raise RuntimeError("Beim Aufteilen ist etwas schiefgegangen. Die Datei bleibt unverändert.")
+        except Exception:
+            item["status"] = "ready"
+            raise
         inbox = src.parent
         parts = []
-        for k in range(len(starts)):
-            part = pymupdf.open()
-            part.insert_pdf(doc, from_page=bounds[k] - 1, to_page=bounds[k + 1] - 2)
-            target = naming.unique_path(inbox / f"{src.stem} – Teil {k + 1}.pdf")
-            part.save(str(target), garbage=3, deflate=True)
-            part.close()
-            parts.append(target)
-            self._split_parts.add(str(target))
-        doc.close()
-        _trash(src)
-        self.history.add("split", str(src), "", "", parts=[str(p) for p in parts])
         with self._lock:
+            for b in built:
+                dst = library.move_file(b, inbox / b.name)
+                self._split_parts.add(str(dst))
+                parts.append(dst)
+            kept = _trash(src)
+            self.history.add("split", str(src), str(kept), "", parts=[str(p) for p in parts])
             self.items.pop(item_id, None)
-        for p in parts:
-            self.add_file(p, origin="inbox")
+            for p in parts:
+                self.add_file(p, origin="inbox")
         self._changed()
         return len(parts)
 

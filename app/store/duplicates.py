@@ -8,7 +8,7 @@ from pathlib import Path
 from .. import jsonfile, paths
 from . import textsim
 
-SIMILAR_THRESHOLD = 0.82
+SIMILAR_THRESHOLD = 0.9
 
 
 class DuplicateIndex:
@@ -75,7 +75,7 @@ class DuplicateIndex:
         """Gibt {path, reason} des ersten Doppelten zurück oder None."""
         ex = str(exclude) if exclude else None
         for p, rec in list(self.files.items()):
-            if p != ex and rec.get("sha") == sha and Path(p).exists():
+            if p != ex and rec.get("sha") == sha and self.known_sha(Path(p)) == sha:
                 return {"path": p, "reason": "identisch"}
         if fingerprint and len(fingerprint) >= 20:
             best, best_p = 0.0, None
