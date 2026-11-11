@@ -1,0 +1,108 @@
+"""Attrappe der KI für Tests und Vorführungen (ORDNUNGSLIEBE_FAKE_AI=1).
+
+Liefert plausible Antworten anhand einfacher Stichwörter, ohne Modell.
+"""
+
+from __future__ import annotations
+
+import re
+import time
+
+from . import prompts
+
+KEYWORDS = [
+    (["kontoauszug", "girokonto", "kontostand"], "Finanzen/Bank", "Kontoauszug"),
+    (["steuerbescheid", "finanzamt", "einkommensteuer"], "Finanzen/Steuern", "Steuerbescheid"),
+    (["hausrat"], "Versicherungen/Hausrat", "Beitragsrechnung"),
+    (["kfz", "fahrzeug", "kennzeichen"], "Versicherungen/Kfz", "Beitragsrechnung"),
+    (["versicherung", "police", "beitrag"], "Versicherungen", "Versicherungsschreiben"),
+    (["strom", "gas", "stadtwerke", "abschlag"], "Wohnen/Strom & Gas", "Stromabrechnung"),
+    (["miete", "mietvertrag", "vermieter", "nebenkosten"], "Wohnen/Miete", "Mietschreiben"),
+    (["gehalt", "lohn", "entgelt", "abrechnung der brutto"], "Arbeit/Gehalt", "Gehaltsabrechnung"),
+    (["schule", "elternbrief", "klasse", "kindergarten", "kita"], "Familie/Schule", "Elternbrief"),
+    (["arzt", "praxis", "rezept", "krankenkasse"], "Gesundheit", "Arztrechnung"),
+    (["rechnung", "betrag", "zahlbar"], "Rechnungen", "Rechnung"),
+]
+
+_DATE = re.compile(r"\b(\d{1,2})\.(\d{1,2})\.(20\d{2}|19\d{2})\b")
+
+
+class FakeAI:
+    def __init__(self, on_status=None):
+        self.on_status = on_status or (lambda *a: None)
+        self.started = False
+
+    def warmup(self):
+        if not self.started:
+            self.on_status("starting", "Test-KI")
+            time.sleep(0.2)
+            self.started = True
+            self.on_status("ready", "Test-KI")
+
+    def shutdown(self):
+        pass
+
+    def chat_json(self, system, user, schema, name, max_tokens=600):
+        self.warmup()
+        time.sleep(0.15)
+        if name == "einordnung":
+            return self._classify(user, schema)
+        if name == "struktur":
+            return self._taxonomy(user)
+        if name == "stapel":
+            return self._split(user)
+        return {}
+
+    def _doc_part(self, user: str) -> str:
+        i = user.rfind("Dokument (Typ")
+        return user[i:].lower() if i >= 0 else user.lower()
+
+    def _classify(self, user: str, schema: dict) -> dict:
+        allowed = schema["properties"]["folder"]["enum"]
+        doc = self._doc_part(user)
+        folder, doc_type, hits = None, "Dokument", 0
+        for words, target, dtype in KEYWORDS:
+            n = sum(doc.count(w) for w in words)
+            if n > hits:
+                candidates = [f for f in allowed if f.lower() == target.lower()] or \
+                             [f for f in allowed if f.split("/")[-1].lower() in target.lower()]
+                folder = candidates[0] if candidates else None
+                new_target = target if not candidates else ""
+                hits, doc_type = n, dtype
+                if folder is None and prompts.NEW_FOLDER in allowed:
+                    folder, new_folder = prompts.NEW_FOLDER, new_target
+                else:
+                    new_folder = ""
+        if folder is None:
+            real = [f for f in allowed if f != prompts.NEW_FOLDER]
+            folder = real[0] if real else prompts.NEW_FOLDER
+            new_folder = "Sonstiges" if folder == prompts.NEW_FOLDER else ""
+        m = _DATE.search(doc)
+        date = f"{m.group(3)}-{int(m.group(2)):02d}" if m else time.strftime("%Y-%m")
+        real = [f for f in allowed if f not in (prompts.NEW_FOLDER, folder)]
+        return {
+            "summary": f"{doc_type} vom {date}",
+            "doc_date": date,
+            "folder": folder,
+            "new_folder": new_folder if folder == prompts.NEW_FOLDER else "",
+            "alternative_folder": real[0] if real and hits < 3 else "",
+            "filename": f"{date} {doc_type}",
+            "confidence": "sehr sicher" if hits >= 3 else ("ziemlich sicher" if hits else "unsicher"),
+        }
+
+    def _taxonomy(self, user: str) -> dict:
+        text = user.lower()
+        folders = []
+        for words, target, dtype in KEYWORDS:
+            if any(w in text for w in words):
+                folders.append({"path": target, "scheme": "JJJJ-MM Dokumentart", "example": f"2026-01 {dtype}"})
+        folders.append({"path": "Sonstiges", "scheme": "JJJJ-MM Dokumentart", "example": "2026-01 Schreiben"})
+        return {"folders": folders}
+
+    def _split(self, user: str) -> dict:
+        starts = [1]
+        for line in user.splitlines():
+            m = re.match(r"Seite (\d+): (.*)", line)
+            if m and int(m.group(1)) > 1 and re.search(r"\b(GmbH|AG|Sehr geehrte)\b", m.group(2)):
+                starts.append(int(m.group(1)))
+        return {"starts": starts}
