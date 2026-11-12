@@ -40,10 +40,29 @@ class SearchIndex:
         self.path = path or (paths.local_dir() / "suche.db")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._db = sqlite3.connect(str(self.path), check_same_thread=False)
-        self._db.executescript(SCHEMA)
-        self._db.commit()
+        try:
+            self._db = self._open()
+        except sqlite3.DatabaseError:
+            # Beschädigt (z. B. nach Stromausfall): ist nur ein Zwischenspeicher → neu aufbauen
+            log.warning("Suchindex beschädigt – wird neu aufgebaut")
+            for suffix in ("", "-wal", "-shm", "-journal"):
+                try:
+                    Path(str(self.path) + suffix).replace(str(self.path) + suffix + ".defekt")
+                except OSError:
+                    pass
+            self._db = self._open()
         self.status = {"running": False, "done": 0, "total": 0, "pending": 0}
+
+    def _open(self) -> sqlite3.Connection:
+        db = sqlite3.connect(str(self.path), check_same_thread=False)
+        try:
+            db.executescript(SCHEMA)
+            db.execute("SELECT COUNT(*) FROM files").fetchone()
+            db.commit()
+        except sqlite3.DatabaseError:
+            db.close()
+            raise
+        return db
 
     def close(self) -> None:
         with self._lock:

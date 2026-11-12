@@ -530,6 +530,7 @@ def test_updater_detects_downloads_and_verifies(env, monkeypatch):
 
     release = {"tag_name": "v9.9.9", "body": "Neue Funktion: Suche\n\nCo-Authored-By: X\n**Installation:** …",
                "assets": [{"name": "Ordnungsliebe-Setup.exe", "size": len(payload),
+                           "digest": "sha256:" + __import__("hashlib").sha256(payload).hexdigest(),
                            "browser_download_url": "https://example.invalid/setup.exe"}]}
     monkeypatch.setattr(up.requests, "get",
                         lambda url, **k: Resp(data=release) if "api.github.com" in url else Resp(body=payload))
@@ -744,3 +745,33 @@ def test_scan_enhance_can_be_switched_off_and_originals_expire(env):
     entry["ts"] = _t.time() - 31 * 86400
     assert api._purge_originals(30) == 1 and not orig.exists()
     api.shutdown()
+
+
+def test_blank_detection_keeps_signature_and_faint_pages(env):
+    import io as _io
+    import pymupdf as _pm
+    from PIL import Image, ImageDraw
+    from app.docs import enhance
+
+    def page_img(draw):
+        img = Image.new("L", (1240, 1754), 255)
+        draw(ImageDraw.Draw(img))
+        buf = _io.BytesIO()
+        img.save(buf, "PNG")
+        return buf.getvalue()
+
+    pages = [
+        page_img(lambda d: [d.text((110, 150 + 40 * k), "Text " * 30, fill=0) for k in range(20)]),
+        page_img(lambda d: d.line([(700, 1500), (760, 1470), (820, 1510), (900, 1480)], fill=20, width=3)),  # Unterschrift
+        page_img(lambda d: d.line([(150, 800), (1000, 800)], fill=120, width=2)),  # blasse Bleistiftlinie
+        page_img(lambda d: d.point([(400, 900), (900, 300)], fill=90)),  # leer mit Staub
+    ]
+    doc = _pm.open()
+    for data in pages:
+        doc.new_page(width=595, height=842).insert_image(_pm.Rect(0, 0, 595, 842), stream=data)
+    texts = ["Text " * 100, "", "", ""]
+    out, rep = enhance.enhance(doc, texts)
+    assert rep["removed"] == [4] and out.page_count == 3
+    # Ohne verlässliche Texterkennung wird nichts entfernt
+    out2, rep2 = enhance.enhance(doc, ["", "", "", ""])
+    assert rep2["removed"] == [] and out2.page_count == 4

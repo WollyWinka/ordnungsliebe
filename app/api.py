@@ -135,8 +135,8 @@ class Api:
         try:
             library.purge_quarantine(30)
             self._purge_originals(30)
-            if self.reorganizer.state.get("phase") not in ("backup",):
-                self.backups.purge_orphans()
+            st = self.reorganizer.state
+            self.backups.purge_orphans(busy_path=st.get("backup_target", "") if st.get("phase") in reorg.ACTIVE else "")
         except Exception:
             log.exception("Aufräumen beim Start fehlgeschlagen")
         self.pipeline.start()
@@ -153,9 +153,14 @@ class Api:
         store = (paths.local_dir() / "Originale").resolve()
         removed = 0
         for e in list(self.history.entries):
-            orig = (e.get("info") or {}).get("original")
-            if e.get("action") != "move" or not orig or e.get("ts", time.time()) > limit:
+            info = e.get("info") or {}
+            orig = info.get("original")
+            if e.get("action") != "move" or not orig or e.get("undone") or e.get("ts", time.time()) > limit:
                 continue
+            if (info.get("cleaned") or {}).get("removed"):
+                continue  # Seiten wurden entfernt → Original bleibt dauerhaft
+            if not reorg._unchanged(Path(e["dst"]), e):
+                continue  # abgelegte Fassung fehlt oder wurde verändert → Original ist die einzige Kopie
             p = Path(orig)
             try:
                 if p.is_file() and p.resolve().parent == store:
@@ -325,6 +330,10 @@ class Api:
             changes["persons"] = names[:12]
         if "person_mode" in changes and changes["person_mode"] not in ("dateiname", "unterordner", "merken"):
             raise ValueError("Unbekannte Einstellung.")
+        if "library_dir" in changes and self.reorganizer.state.get("phase") in reorg.ACTIVE \
+                and changes["library_dir"] != self.settings_store.get().library_dir:
+            raise ValueError("Während einer Neuordnung kann die Ablage nicht geändert werden. "
+                             "Schließe die Neuordnung erst ab oder brich sie ab.")
         if "inbox_dir" in changes or "library_dir" in changes:
             cur = self.settings_store.get()
             inbox = Path(changes.get("inbox_dir", cur.inbox_dir))
@@ -375,7 +384,7 @@ class Api:
     @api_method
     def open_folder(self, path: str):
         p = Path(path)
-        if not p.exists():
+        if not p.is_dir():
             raise FileNotFoundError("Der Ordner existiert nicht mehr.")
         if paths.IS_WINDOWS:
             os.startfile(str(p))  # type: ignore[attr-defined]
@@ -395,23 +404,29 @@ class Api:
 
     @api_method
     def update_install(self):
-        """Neuordnung pausieren, alles sichern, Installation starten, Fenster schließen."""
+        """Erst prüfen, dann Neuordnung pausieren, alles sichern und beenden, dann Installation starten."""
+        self.updater.check_ready()
         self.reorganizer.pause()
         t = self.reorganizer._thread
         if t is not None:
             t.join(timeout=30)
-        self.pipeline._persist()
-        self.updater.install()
+        try:
+            self.pipeline._persist()
+        except Exception:
+            log.exception("Warteschlange konnte vor dem Update nicht gesichert werden")
 
-        def close():
-            time.sleep(1.5)
-            self.shutdown()
-            if self._window is not None:
-                try:
-                    self._window.destroy()
-                except Exception:
-                    os._exit(0)
-        threading.Thread(target=close, daemon=True).start()
+        def run():
+            time.sleep(0.8)  # Antwort an die Oberfläche geht noch raus
+            try:
+                self.shutdown()  # gibt KI-Programm und Dateien frei
+            except Exception:
+                log.exception("Beenden vor dem Update unvollständig")
+            try:
+                self.updater.install()
+            except Exception:
+                log.exception("Update konnte nicht gestartet werden")
+            os._exit(0)
+        threading.Thread(target=run, daemon=True).start()
         return True
 
     # --- Einrichtung ----------------------------------------------------------------
@@ -645,7 +660,7 @@ class Api:
             sha = self.search_index.sha_for_path(path)
             if not sha or not self.docmeta.get(sha):
                 raise ValueError("Dieses Dokument kenne ich noch nicht genauer – lege es in eine eigene Mappe.")
-            self.docmeta.set_flag(sha, steuer=True)
+            self.docmeta.set_flag(sha, steuer=True, steuer_manual=True)
             return True
         if not Path(path).exists():
             raise FileNotFoundError("Die Datei ist nicht mehr da.")
@@ -660,7 +675,7 @@ class Api:
             sha = sha if sha and self.docmeta.get(sha) else (found[0] if found else "")
             if not sha:
                 raise KeyError("Dokument nicht gefunden.")
-            self.docmeta.set_flag(sha, steuer=False)
+            self.docmeta.set_flag(sha, steuer=False, steuer_manual=True)
             return True
         self.collections.remove(cid, path)
         return True

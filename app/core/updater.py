@@ -6,6 +6,7 @@ Versionsnummer abzufragen bzw. die Installationsdatei zu laden. Dokumente bleibe
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -20,7 +21,7 @@ from .. import APP_VERSION, paths
 
 log = logging.getLogger(__name__)
 
-REPO = os.environ.get("ORDNUNGSLIEBE_UPDATE_REPO", "WollyWinka/ordnungsliebe")
+REPO = "WollyWinka/ordnungsliebe"
 ASSET = "Ordnungsliebe-Setup.exe"
 API = "https://api.github.com/repos/{repo}/releases/latest"
 
@@ -65,10 +66,15 @@ class Updater:
             log.info("Update-Prüfung fehlgeschlagen: %s", exc)
             return {**self.status(), "error": "Keine Verbindung zum Update-Server."}
         latest = data.get("tag_name", "")
-        asset = next((a for a in data.get("assets", []) if a.get("name") == ASSET), None)
+        assets = data.get("assets", [])
+        asset = next((a for a in assets if a.get("name") == ASSET), None)
+        sha_asset = next((a for a in assets if a.get("name") == ASSET + ".sha256"), None)
+        digest = str((asset or {}).get("digest") or "")
         available = asset is not None and _ver(latest) > _ver(APP_VERSION)
         self.info = {"available": available, "version": latest.lstrip("v"), "url": asset["browser_download_url"] if asset else "",
                      "size": asset.get("size", 0) if asset else 0, "notes": _clean_notes(data.get("body", "")),
+                     "sha256": digest.split(":", 1)[1].lower() if digest.startswith("sha256:") else "",
+                     "sha_url": sha_asset["browser_download_url"] if sha_asset else "",
                      "checked": time.time()}
         self.bus.emit("update", self.status())
         return self.status()
@@ -118,6 +124,15 @@ class Updater:
             expected = self.info.get("size", 0)
             if expected and part.stat().st_size != expected:
                 raise IOError("Die heruntergeladene Datei ist unvollständig.")
+            want = self.info.get("sha256") or self._sha_from_asset()
+            if not want:
+                raise IOError("Die Prüfsumme der neuen Version fehlt.")
+            h = hashlib.sha256()
+            with open(part, "rb") as fh:
+                for block in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(block)
+            if h.hexdigest().lower() != want:
+                raise IOError("Die heruntergeladene Datei ist beschädigt (Prüfsumme stimmt nicht).")
             part.replace(target)
             self.file = target
             self.state = "ready"
@@ -132,13 +147,28 @@ class Updater:
                 pass
         self.bus.emit("update", self.status())
 
-    def install(self) -> None:
-        """Startet die stille Installation. Das Programm muss sich danach selbst beenden."""
+    def _sha_from_asset(self) -> str:
+        url = self.info.get("sha_url")
+        if not url:
+            return ""
+        try:
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            m = re.search(r"\b([0-9a-fA-F]{64})\b", r.text)
+            return m.group(1).lower() if m else ""
+        except Exception:
+            return ""
+
+    def check_ready(self) -> None:
         if self.state != "ready" or not self.file or not self.file.exists():
             raise ValueError("Die neue Version ist noch nicht heruntergeladen.")
         if not self.status()["can_install"]:
             raise ValueError("Updates lassen sich nur in der installierten Windows-Version einspielen.")
+
+    def install(self) -> None:
+        """Startet die stille Installation. Das Programm muss sich direkt danach beenden."""
+        self.check_ready()
         flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-        subprocess.Popen([str(self.file), "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/UPDATE"],
-                         creationflags=flags, close_fds=True)
+        subprocess.Popen([str(self.file), "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS",
+                          "/UPDATE"], creationflags=flags, close_fds=True)
         self.state = "installing"

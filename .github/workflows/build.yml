@@ -81,6 +81,8 @@ jobs:
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
           & "$iscc" "/DMyAppVersion=$env:VERSION" build/installer.iss
           Get-Item dist/Ordnungsliebe-Setup.exe | Format-List Name, Length
+          $h = (Get-FileHash dist/Ordnungsliebe-Setup.exe -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path dist/Ordnungsliebe-Setup.exe.sha256 -Value "$h  Ordnungsliebe-Setup.exe" -NoNewline -Encoding ascii
 
       - name: Als Build-Ergebnis ablegen
         uses: actions/upload-artifact@v4
@@ -95,7 +97,9 @@ jobs:
           tag_name: v${{ env.VERSION }}
           name: Ordnungsliebe ${{ env.VERSION }}
           make_latest: true
-          files: dist/Ordnungsliebe-Setup.exe
+          files: |
+            dist/Ordnungsliebe-Setup.exe
+            dist/Ordnungsliebe-Setup.exe.sha256
           body: |
             ${{ github.event.head_commit.message }}
 

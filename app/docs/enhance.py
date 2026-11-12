@@ -16,8 +16,8 @@ log = logging.getLogger(__name__)
 
 MAX_DPI = 300
 MIN_DPI = 150
-BLANK_INK = 0.004          # Anteil dunkler Pixel, unter dem eine Seite als leer gilt (mit leerem Text)
-BLANK_INK_NO_TEXT = 0.0015  # strenger, wenn kein erkannter Text vorliegt
+BLANK_INK = 0.0003         # Anteil „Tinte“ (bei ~100 dpi, relativ zum Papier), unter dem eine Seite leer ist
+INK_DELTA = 40             # so viel dunkler als das Papier gilt als Tinte (auch Bleistift, Unterschrift)
 DESKEW_MAX = 5.0
 DESKEW_MIN = 0.3
 JPEG_QUALITY = 72
@@ -42,13 +42,17 @@ def _render(page: pymupdf.Page, dpi: int) -> Image.Image:
     return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
 
-def _ink(gray_small: Image.Image) -> float:
-    w, h = gray_small.size
-    mx, my = int(w * 0.05), int(h * 0.05)
-    inner = gray_small.crop((mx, my, w - mx, h - my))
+def _ink(gray: Image.Image) -> float:
+    """Anteil der Pixel, die deutlich dunkler sind als das Papier (Rand bleibt außen vor)."""
+    w, h = gray.size
+    mx, my = int(w * 0.04), int(h * 0.04)
+    inner = gray.crop((mx, my, w - mx, h - my))
     hist = inner.histogram()
-    dark = sum(hist[:150])
-    return dark / max(1, inner.size[0] * inner.size[1])
+    total = max(1, inner.size[0] * inner.size[1])
+    # Papierfarbe = häufigster heller Wert
+    paper = max(range(100, 256), key=lambda v: hist[v])
+    dark = sum(hist[: max(0, paper - INK_DELTA)])
+    return dark / total
 
 
 def _is_color(img: Image.Image) -> bool:
@@ -63,6 +67,18 @@ def _score(binary: Image.Image) -> float:
     rows = list(binary.resize((1, binary.height), Image.BOX).tobytes())
     mean = sum(rows) / len(rows)
     return sum((r - mean) ** 2 for r in rows) / len(rows)
+
+
+def _rotate_keep_all(img: Image.Image, angle: float) -> Image.Image:
+    """Dreht, ohne Ecken abzuschneiden: gedrehtes Bild wird verkleinert auf die alte Seitengröße gesetzt."""
+    fill = (255, 255, 255) if img.mode == "RGB" else 255
+    rot = img.rotate(angle, resample=Image.BICUBIC, expand=True, fillcolor=fill)
+    w, h = img.size
+    scale = min(w / rot.width, h / rot.height)
+    rot = rot.resize((max(1, int(rot.width * scale)), max(1, int(rot.height * scale))), Image.LANCZOS)
+    canvas = Image.new(img.mode, (w, h), fill)
+    canvas.paste(rot, ((w - rot.width) // 2, (h - rot.height) // 2))
+    return canvas
 
 
 def skew_angle(gray: Image.Image) -> float:
@@ -80,7 +96,7 @@ def skew_angle(gray: Image.Image) -> float:
             if s > best_score:
                 best, best_score = round(a, 2), s
             a += step
-    if base <= 0 or best_score < base * 1.05:
+    if base <= 0 or best_score < base * 1.15:  # nur bei deutlichem Ergebnis drehen
         return 0.0
     return best
 
@@ -89,6 +105,9 @@ def enhance(doc: pymupdf.Document, page_texts: list[str] | None = None, *, remov
             deskew: bool = True, compress: bool = True) -> tuple[pymupdf.Document, dict]:
     """Gibt ein neues Dokument und eine Übersicht zurück: {"removed": [...], "deskewed": n, "compressed": n}."""
     report = {"removed": [], "deskewed": 0, "compressed": 0}
+    # Leere Seiten nur entfernen, wenn die Texterkennung sicher funktioniert hat (andere Seiten haben Text)
+    ocr_ok = bool(page_texts) and len(page_texts) == doc.page_count and \
+        any(len((t or "").strip()) >= 20 for t in page_texts)
     plan = []  # (index, None | jpeg_bytes, rect)
     for i, page in enumerate(doc):
         if not _is_scan_page(page):
@@ -98,11 +117,10 @@ def enhance(doc: pymupdf.Document, page_texts: list[str] | None = None, *, remov
             dpi = _page_dpi(page)
             img = _render(page, dpi)
             gray = img.convert("L")
-            small = gray.resize((300, max(1, int(300 * gray.height / gray.width))))
-            ink = _ink(small)
+            w100 = max(1, int(page.rect.width / 72 * 100))  # etwa 100 dpi
+            ink = _ink(gray.resize((w100, max(1, int(w100 * gray.height / gray.width))), Image.BOX))
             text = (page_texts[i] if page_texts and i < len(page_texts) else "") or ""
-            limit = BLANK_INK if page_texts else BLANK_INK_NO_TEXT
-            if remove_blank and ink < limit and len(text.strip()) < 3:
+            if remove_blank and ocr_ok and ink < BLANK_INK and len(text.strip()) < 3:
                 report["removed"].append(i + 1)
                 continue
             out_img = img if _is_color(img) else gray
@@ -110,8 +128,7 @@ def enhance(doc: pymupdf.Document, page_texts: list[str] | None = None, *, remov
             if deskew and ink > 0.01:
                 angle = skew_angle(gray)
                 if abs(angle) >= DESKEW_MIN:
-                    fill = (255, 255, 255) if out_img.mode == "RGB" else 255
-                    out_img = out_img.rotate(angle, resample=Image.BICUBIC, fillcolor=fill)
+                    out_img = _rotate_keep_all(out_img, angle)
                     report["deskewed"] += 1
                     changed = True
             if not (compress or changed):

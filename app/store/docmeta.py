@@ -34,9 +34,13 @@ class DocMeta:
             done = {(d["date"], d["what"]) for d in old.get("deadlines", []) if d.get("done")}
             dls = [{"date": d["date"], "what": d["what"], "done": (d["date"], d["what"]) in done}
                    for d in (deadlines or [])]
+            if old.get("steuer_manual"):  # Entscheidung des Nutzers geht vor
+                steuer = old.get("steuer", False)
             rec = {"path": path, "folder": folder, "summary": summary, "doc_date": doc_date,
                    "deadlines": dls, "person": person, "steuer": bool(steuer), "entry": entry_id,
                    "ts": time.time(), "collections": old.get("collections", [])}
+            if old.get("steuer_manual"):
+                rec["steuer_manual"] = True
             self.docs[sha] = rec
             self._save()
             return rec

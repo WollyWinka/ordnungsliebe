@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 import queue
 import threading
@@ -80,20 +81,29 @@ class Pipeline:
 
     def _persist(self) -> None:
         """Warteschlange samt fertiger Vorschläge sichern – übersteht Neustart und Update."""
-        with self._lock:
-            data = []
-            for it in self.items.values():
-                rec = {k: v for k, v in it.items() if k not in self._SKIP_KEYS}
-                try:
-                    st = Path(it["src"]).stat()
-                    rec["_size"], rec["_mtime"] = st.st_size, st.st_mtime
-                except OSError:
-                    continue
-                data.append(rec)
-            self._dirty = False
+        data = None
+        for _ in range(5):  # Einträge können sich gerade ändern → kurze Wiederholung
+            try:
+                with self._lock:
+                    items = list(self.items.values())
+                    data = [json.loads(json.dumps({k: v for k, v in it.items() if k not in self._SKIP_KEYS},
+                                                  default=str)) for it in items]
+                    self._dirty = False
+                break
+            except RuntimeError:
+                time.sleep(0.05)
+        if data is None:
+            self._dirty = True
+            return
+        for rec in list(data):
+            try:
+                st = Path(rec["src"]).stat()
+                rec["_size"], rec["_mtime"] = st.st_size, st.st_mtime
+            except OSError:
+                data.remove(rec)
         try:
             jsonfile.save(self._queue_file, {"v": 1, "items": data})
-        except OSError:
+        except Exception:
             log.warning("Warteschlange konnte nicht gespeichert werden")
 
     def _restore(self) -> None:
@@ -135,7 +145,10 @@ class Pipeline:
     # --- Ereignisse ---------------------------------------------------------------
     def _changed(self) -> None:
         self._dirty = True
-        self.bus.emit("queue", self.overview())
+        try:
+            self.bus.emit("queue", self.overview())
+        except Exception:
+            log.exception("Statusmeldung fehlgeschlagen")
 
     # --- Scan-Ordner beobachten ---------------------------------------------------
     def _poll(self) -> None:
@@ -145,7 +158,10 @@ class Pipeline:
             except Exception:
                 log.exception("Fehler beim Prüfen des Scan-Ordners")
             if self._dirty:
-                self._persist()
+                try:
+                    self._persist()
+                except Exception:
+                    log.exception("Warteschlange konnte nicht gespeichert werden")
             self._stop.wait(POLL_SECONDS)
 
     def _scan_inbox(self) -> None:
@@ -381,8 +397,10 @@ class Pipeline:
         ready = sum(1 for i in items if i["status"] in ("ready", "error"))
         working = sum(1 for i in items if i["status"] in ("waiting", "analyzing"))
         by_origin = {}
+        with self._lock:
+            all_items = list(self.items.values())
         for o in ("inbox", "reorg"):
-            sub = [i for i in self.items.values() if i["origin"] == o]
+            sub = [i for i in all_items if i["origin"] == o]
             by_origin[o] = {"total": len(sub),
                             "working": sum(1 for i in sub if i["status"] in ("waiting", "analyzing")),
                             "batch": sum(1 for i in sub if self._in_batch(i)),

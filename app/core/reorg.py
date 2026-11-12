@@ -140,7 +140,8 @@ class Reorganizer:
         if self.state.get("phase") in ("structure_review", "review", "paused"):
             return self.status()
         gid = self.history.start_group("neuordnung", mode=mode, library=str(self.root))
-        self.state = {"group": gid, "mode": mode, "phase": "backup", "started": time.time()}
+        self.state = {"group": gid, "mode": mode, "phase": "backup", "started": time.time(),
+                      "library": str(self.root)}
         self._save()
         self._launch("backup")
         return self.status()
@@ -160,6 +161,10 @@ class Reorganizer:
     def resume(self) -> dict:
         if self.state.get("phase") != "paused" or (self._thread and self._thread.is_alive()):
             return self.status()
+        lib = self.state.get("library")
+        if lib and Path(lib) != self.root:
+            raise ReorgError("Die Ablage wurde inzwischen geändert. Bitte stelle sie in den Einstellungen wieder auf "
+                             f"„{lib}“ oder brich die Neuordnung ab.")
         phase = self.state.get("paused_phase", "backup")
         self.state["phase"] = phase
         self._save()
@@ -267,6 +272,16 @@ class Reorganizer:
             self.state["backup_target"] = str(target)
             self._save()
         saved: list[str] = self.state.setdefault("backed_up", [])
+        if saved:  # nach einer Pause: nur gelten lassen, was wirklich vollständig in der Sicherung liegt
+            ok = []
+            for x in saved:
+                try:
+                    rel = Path(x).relative_to(root)
+                    if os.path.getsize(library.long_path(target / rel)) == os.path.getsize(library.long_path(Path(x))):
+                        ok.append(x)
+                except (OSError, ValueError):
+                    pass
+            saved[:] = ok
         skipped: list[dict] = self.state.setdefault("skipped", [])
         done = set(saved) | {root.joinpath(*x["rel"].split("/")).as_posix() for x in skipped}
         done_posix = {Path(x).as_posix() for x in done}
@@ -298,6 +313,8 @@ class Reorganizer:
 
     def _read_all(self) -> list[dict]:
         root = self.root
+        if "docs" in self.state and "backed_up" not in self.state:
+            return self._docs_from_cache()  # Lesen war schon fertig (Neustart kurz danach)
         files = [Path(p) for p in self.state.get("backed_up", [])]  # nur gesicherte Dateien
         partial: list[dict] = self.state.setdefault("docs_partial", [])
         done = {d["path"] for d in partial}
