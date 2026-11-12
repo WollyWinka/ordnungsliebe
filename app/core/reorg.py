@@ -80,8 +80,13 @@ def dir_size(root: Path) -> tuple[int, int]:
     return count, size
 
 
+RUNNING = ("backup", "reading", "structure")
+ACTIVE = RUNNING + ("paused", "structure_review", "review")
+
+
 class Reorganizer:
-    """Zustand wird in neuordnung.json gehalten, damit ein Neustart nichts kaputt macht."""
+    """Zustand wird in neuordnung.json gehalten. Sicherung, Einlesen und Struktur lassen sich
+    pausieren und nach einem Neustart (z. B. nach einem Update) genau dort fortsetzen."""
 
     def __init__(self, settings_store, ai, pipeline, history, schemes, dupindex, backups, bus):
         self.settings_store = settings_store
@@ -96,12 +101,13 @@ class Reorganizer:
         self.state: dict = jsonfile.load(self.state_path, {})
         self._thread: threading.Thread | None = None
         self._cancel = threading.Event()
+        self._pause_requested = False
         pipeline.on_reorg_folder_added = self._folder_added
-        # Nach einem Neustart: laufende Phase zurück auf einen sicheren Punkt setzen
-        if self.state.get("phase") in ("backup", "reading", "structure"):
-            self.state.update(phase="cancelled")
+        # Nach einem Neustart: laufende Arbeit gilt als pausiert und kann fortgesetzt werden
+        if self.state.get("phase") in RUNNING:
+            self.state.update(paused_phase=self.state["phase"], phase="paused")
             self._save()
-        elif self.state.get("phase") == "review":
+        if self.state.get("phase") == "review":
             self._requeue_review()
 
     @property
@@ -111,13 +117,15 @@ class Reorganizer:
     def _save(self) -> None:
         jsonfile.save(self.state_path, self.state)
 
-    def _progress(self, phase: str, done: int = 0, total: int = 0, detail: str = "") -> None:
+    def _progress(self, phase: str, done: int = 0, total: int = 0, detail: str = "", save: bool = True) -> None:
         self.state.update(phase=phase, done=done, total=total, detail=detail)
-        self._save()
+        if save:
+            self._save()
         self.bus.emit("reorg", self.status())
 
     def status(self) -> dict:
-        st = {k: v for k, v in self.state.items() if k not in ("docs", "backed_up", "skipped")}
+        hidden = ("docs", "backed_up", "skipped", "docs_partial", "structure_draft")
+        st = {k: v for k, v in self.state.items() if k not in hidden}
         st["skipped_count"] = len(self.state.get("skipped", []))
         if st.get("phase") == "review":
             ov = self.pipeline.overview("reorg")
@@ -125,23 +133,43 @@ class Reorganizer:
             st["working"] = ov["working"]
         return st
 
-    # --- Start ----------------------------------------------------------------------
+    # --- Start, Pause, Fortsetzen ---------------------------------------------------
     def start(self, mode: str) -> dict:
         if self._thread and self._thread.is_alive():
             return self.status()
-        if self.state.get("phase") in ("structure_review", "review"):
+        if self.state.get("phase") in ("structure_review", "review", "paused"):
             return self.status()
-        self._cancel.clear()
         gid = self.history.start_group("neuordnung", mode=mode, library=str(self.root))
         self.state = {"group": gid, "mode": mode, "phase": "backup", "started": time.time()}
         self._save()
-        self._thread = threading.Thread(target=self._run, name="neuordnung", daemon=True)
+        self._launch("backup")
+        return self.status()
+
+    def _launch(self, phase: str) -> None:
+        self._cancel.clear()
+        self._pause_requested = False
+        self._thread = threading.Thread(target=self._run, args=(phase,), name="neuordnung", daemon=True)
         self._thread.start()
+
+    def pause(self) -> dict:
+        if self.state.get("phase") in RUNNING and self._thread and self._thread.is_alive():
+            self._pause_requested = True
+            self._cancel.set()
+        return self.status()
+
+    def resume(self) -> dict:
+        if self.state.get("phase") != "paused" or (self._thread and self._thread.is_alive()):
+            return self.status()
+        phase = self.state.get("paused_phase", "backup")
+        self.state["phase"] = phase
+        self._save()
+        self._launch(phase)
         return self.status()
 
     def cancel(self) -> None:
+        self._pause_requested = False
         self._cancel.set()
-        if self.state.get("phase") in ("structure_review", "review"):
+        if self.state.get("phase") in ("structure_review", "review", "paused"):
             self.pipeline.remove_origin("reorg")
             gid = self.state.get("group", "")
             entries = self.history.group_entries(gid)
@@ -151,15 +179,32 @@ class Reorganizer:
             self._save()
             self.bus.emit("reorg", self.status())
 
-    def _run(self) -> None:
+    def _stopped(self, phase: str) -> bool:
+        """Wurde unterbrochen? Dann Zustand passend setzen (pausiert oder abgebrochen)."""
+        if not self._cancel.is_set():
+            return False
+        if self._pause_requested:
+            self.state["paused_phase"] = phase
+            self._progress("paused", self.state.get("done", 0), self.state.get("total", 0))
+        else:
+            self._progress("cancelled")
+        return True
+
+    def _run(self, phase: str = "backup") -> None:
         try:
-            self._backup()
-            if self._cancel.is_set():
-                return self._progress("cancelled")
-            docs = self._read_all()
-            if self._cancel.is_set():
-                return self._progress("cancelled")
+            if phase == "backup":
+                self._backup()
+                if self._stopped("backup"):
+                    return
+            if phase in ("backup", "reading"):
+                docs = self._read_all()
+                if self._stopped("reading"):
+                    return
+            else:
+                docs = self._docs_from_cache()
             self._build_structure(docs)
+            if self._stopped("structure"):
+                return
         except (LLMError, OcrUnavailable, ReorgError) as exc:
             log.warning("Neuordnung abgebrochen: %s", exc)
             self.state["error"] = str(exc)
@@ -193,7 +238,8 @@ class Reorganizer:
         """Sichert genau die Dokumente, die die Neuordnung anfassen darf – Datei für Datei.
 
         Dateien, die sich nicht sichern lassen (z. B. weil iCloud sie gerade nicht liefert),
-        werden übersprungen und später NICHT verschoben.
+        werden übersprungen und später NICHT verschoben. Nach einer Pause geht es mit der
+        nächsten noch nicht gesicherten Datei weiter.
         """
         root = self.root
         self._progress("backup", 0, 0, "Ich suche deine Dokumente …")
@@ -206,22 +252,32 @@ class Reorganizer:
                 size += p.stat().st_size
             except OSError:
                 pass
-        free = shutil.disk_usage(paths.backups_dir()).free
-        need = size * 1.05 + 300 * 1024 * 1024
-        if free < need:
-            raise ReorgError(
-                f"Für die Sicherung werden etwa {need / 1e9:.1f} GB gebraucht, frei sind nur "
-                f"{free / 1e9:.1f} GB. Bitte mach Platz frei oder wähle als Ablage einen kleineren Ordner."
-                .replace(".", ",", 2))
-        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-        target = paths.backups_dir() / f"{stamp} {root.name} {self.state['group'][:4]}"
-        target.mkdir(parents=True, exist_ok=False)
-        saved, skipped = [], []
+        target = Path(self.state["backup_target"]) if self.state.get("backup_target") else None
+        if target is None:
+            free = shutil.disk_usage(paths.backups_dir()).free
+            need = size * 1.05 + 300 * 1024 * 1024
+            if free < need:
+                raise ReorgError(
+                    f"Für die Sicherung werden etwa {need / 1e9:.1f} GB gebraucht, frei sind nur "
+                    f"{free / 1e9:.1f} GB. Bitte mach Platz frei oder wähle als Ablage einen kleineren Ordner."
+                    .replace(".", ",", 2))
+            stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+            target = paths.backups_dir() / f"{stamp} {root.name} {self.state['group'][:4]}"
+            target.mkdir(parents=True, exist_ok=False)
+            self.state["backup_target"] = str(target)
+            self._save()
+        saved: list[str] = self.state.setdefault("backed_up", [])
+        skipped: list[dict] = self.state.setdefault("skipped", [])
+        done = set(saved) | {root.joinpath(*x["rel"].split("/")).as_posix() for x in skipped}
+        done_posix = {Path(x).as_posix() for x in done}
         for i, p in enumerate(files, 1):
             if self._cancel.is_set():
-                break
+                self._save()
+                return
+            if p.as_posix() in done_posix:
+                continue
             if i % 5 == 1 or i == len(files):
-                self._progress("backup", i - 1, len(files), p.name)
+                self._progress("backup", i - 1, len(files), p.name, save=(i % 50 == 1))
             rel = p.relative_to(root)
             reason = self._copy_with_retry(p, target / rel)
             if reason:
@@ -235,58 +291,77 @@ class Reorganizer:
             raise ReorgError("Keine einzige Datei ließ sich sichern. Deshalb verändere ich nichts." + hint)
         rec = {"id": self.state["group"], "ts": time.time(), "path": str(target), "count": len(saved),
                "size": size, "library": str(root), "skipped": len(skipped)}
-        self.backups.add(rec)
+        if not any(b["id"] == rec["id"] for b in self.backups.items):
+            self.backups.add(rec)
         self.state["backup"] = rec
-        self.state["backed_up"] = saved
-        self.state["skipped"] = skipped
         self._progress("backup", len(files), len(files))
 
     def _read_all(self) -> list[dict]:
         root = self.root
         files = [Path(p) for p in self.state.get("backed_up", [])]  # nur gesicherte Dateien
-        docs = []
+        partial: list[dict] = self.state.setdefault("docs_partial", [])
+        done = {d["path"] for d in partial}
+        docs = [dict(d, text=(reader.cached_text(d["sha"]) or "")[:1500]) for d in partial]
         for i, p in enumerate(files, 1):
             if self._cancel.is_set():
-                break
-            self._progress("reading", i - 1, len(files), p.name)
+                self._save()
+                return docs
+            if str(p) in done:
+                continue
+            self._progress("reading", i - 1, len(files), p.name, save=False)
             try:
                 sha = reader.file_hash(p)
                 doc = reader.read_document(p, sha=sha)
                 fp = textsim.fingerprint(doc.text)
                 self.dup.add_file(p, sha, fp)
-                docs.append({"path": str(p), "rel": "/".join(p.relative_to(root).parts),
-                             "text": doc.text[:1500], "sha": sha})
+                entry = {"path": str(p), "rel": "/".join(p.relative_to(root).parts), "sha": sha}
+                partial.append(entry)
+                docs.append(dict(entry, text=doc.text[:1500]))
             except OcrUnavailable:
                 raise
             except Exception:
                 log.exception("Konnte %s nicht lesen", p)
                 self.state.setdefault("skipped", []).append(
                     {"rel": "/".join(p.relative_to(root).parts), "reason": "konnte nicht gelesen werden"})
-            if i % 50 == 0:
+            if i % 25 == 0:
                 self.dup.save()
+                self._save()
         self.dup.save()
         self.state["docs"] = [{"path": d["path"], "rel": d["rel"], "sha": d["sha"]} for d in docs]
+        self.state.pop("docs_partial", None)
         self.state.pop("backed_up", None)
         self._progress("reading", len(files), len(files))
         return docs
+
+    def _docs_from_cache(self) -> list[dict]:
+        return [dict(d, text=(reader.cached_text(d["sha"]) or "")[:1500]) for d in self.state.get("docs", [])]
 
     def _build_structure(self, docs: list[dict]) -> None:
         root = self.root
         existing = library.folder_counts(root)
         self._progress("structure", 0, 1)
         structure = tasks.build_taxonomy(self.ai, docs, self.state.get("mode", "neu"), existing,
-                                         on_progress=lambda d, t: self._progress("structure", d, t))
+                                         on_progress=lambda d, t: self._progress("structure", d, t),
+                                         should_stop=self._cancel.is_set)
+        if self._cancel.is_set():
+            return
         if not structure:
             raise LLMError("Die KI konnte keine Ordnerstruktur vorschlagen.")
-        # Beispiel-Dateinamen und Anzahl je Ordner ergänzen (Anzahl ist eine Schätzung)
         self.state["structure"] = structure
         self.state["doc_count"] = len(docs)
         self._progress("structure_review")
 
     # --- Struktur prüfen ----------------------------------------------------------
+    def save_draft(self, folders: list[dict]) -> None:
+        """Änderungen an der Struktur sofort sichern (auch vor „Struktur übernehmen“)."""
+        if self.state.get("phase") == "structure_review":
+            self.state["structure_draft"] = folders
+            self._save()
+
     def get_structure(self) -> dict:
         skipped = self.state.get("skipped", [])
-        return {"folders": self.state.get("structure", []), "doc_count": self.state.get("doc_count", 0),
+        folders = self.state.get("structure_draft") or self.state.get("structure", [])
+        return {"folders": folders, "doc_count": self.state.get("doc_count", 0),
                 "backup": self.state.get("backup"), "skipped_count": len(skipped),
                 "skipped": skipped[:8]}
 
@@ -295,6 +370,7 @@ class Reorganizer:
         if not folders:
             raise ValueError("Die Struktur ist leer.")
         self.state["structure"] = folders
+        self.state.pop("structure_draft", None)
         self.schemes.set_all(self.root, folders)
         self.state["phase"] = "review"
         self._save()

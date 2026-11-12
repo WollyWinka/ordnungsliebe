@@ -521,6 +521,19 @@ class Api:
         return self.reorganizer.finish()
 
     @api_method
+    def reorg_pause(self):
+        return self.reorganizer.pause()
+
+    @api_method
+    def reorg_resume(self):
+        return self.reorganizer.resume()
+
+    @api_method
+    def reorg_save_structure(self, folders: list[dict]):
+        self.reorganizer.save_draft(folders)
+        return True
+
+    @api_method
     def reorg_cancel(self):
         self.reorganizer.cancel()
         return True

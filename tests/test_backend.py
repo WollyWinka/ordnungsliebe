@@ -403,3 +403,110 @@ def test_new_subfolder_during_reorg_is_allowed_and_kept(env):
     assert api.item(reorg_items[1]["id"])["data"]["suggestion"]["folder"] == "Arbeit/Gehalt/Entgeltnachweise"
     assert any(f["path"] == "Arbeit/Gehalt/Entgeltnachweise" for f in api.folders("reorg")["data"])
     api.shutdown()
+
+
+def test_queue_with_suggestions_survives_restart(env):
+    api = make_api(env)
+    _entgelt(env["inbox"] / "e1.pdf", "September")
+    text_pdf(env["inbox"] / "k.pdf", ["Sparkasse", "Kontoauszug Girokonto vom 01.10.2026", "Kontoauszug"])
+    assert wait_for(lambda: api.pipeline.overview()["total"] == 2 and api.pipeline.overview()["working"] == 0)
+    before = {i["src"]: i["suggestion"]["folder"] for i in api.pipeline.items.values()}
+    api.pipeline.skip(next(iter(api.pipeline.items)))
+    api.shutdown()  # speichert die Warteschlange
+
+    from app.api import Api
+    api2 = Api()
+    calls = []
+    orig = api2.ai.chat_json
+    api2.ai.chat_json = lambda *a, **k: calls.append(1) or orig(*a, **k)
+    after = {i["src"]: (i["status"], i["suggestion"]["folder"]) for i in api2.pipeline.items.values()}
+    assert {k: v[1] for k, v in after.items()} == before
+    assert all(v[0] == "ready" for v in after.values())
+    assert any(i["skip"] for i in api2.pipeline.items.values())
+    api2.start_background()
+    import time as _t
+    _t.sleep(2)
+    assert calls == []  # nichts neu berechnet
+    item = next(iter(api2.pipeline.items.values()))
+    assert api2.confirm(item["id"])["ok"]
+    assert api2.memory.entries[-1]["text"]  # Text aus dem Zwischenspeicher wiederhergestellt
+    api2.shutdown()
+
+
+def test_reorg_pause_restart_resume_backup(env, monkeypatch):
+    lib = env["lib"]
+    (lib / "Alt").mkdir()
+    for i in range(12):
+        text_pdf(lib / "Alt" / f"d{i}.pdf", ["Stadtwerke", f"Stromabrechnung Nr {i} vom 01.0{1 + i % 9}.2026"])
+    api = make_api(env)
+    import shutil as _sh
+    import time as _t
+    real = _sh.copy2
+    copied = []
+
+    def slow(src, dst, *a, **k):
+        if str(src).endswith(".pdf"):
+            _t.sleep(0.15)
+            copied.append(str(src))
+        return real(src, dst, *a, **k)
+    monkeypatch.setattr("app.core.reorg.shutil.copy2", slow)
+    api.reorg_start("neu")
+    assert wait_for(lambda: len(copied) >= 4, timeout=30)
+    api.reorg_pause()
+    assert wait_for(lambda: api.reorganizer.state.get("phase") == "paused", timeout=30)
+    assert api.reorganizer.state["paused_phase"] == "backup"
+    n_first = len(api.reorganizer.state["backed_up"])
+    assert 0 < n_first < 13
+    api.shutdown()
+
+    from app.api import Api
+    api2 = Api()  # „Neustart nach Update“
+    assert api2.reorganizer.state["phase"] == "paused"
+    api2.start_background()
+    copied.clear()
+    api2.reorg_resume()
+    assert wait_for(lambda: api2.reorganizer.state.get("phase") in ("structure_review", "error"), timeout=120)
+    assert api2.reorganizer.state["phase"] == "structure_review", api2.reorganizer.state
+    assert len(copied) == 13 - n_first  # bereits gesicherte Dateien wurden nicht erneut kopiert
+    backup = Path(api2.reorganizer.state["backup"]["path"])
+    assert len(list(backup.rglob("*.pdf"))) == 13
+    # Strukturentwurf überlebt einen Neustart
+    folders = api2.reorg_structure()["data"]["folders"] + [{"path": "Testordner", "scheme": "", "example": ""}]
+    api2.reorg_save_structure(folders)
+    api2.shutdown()
+    api3 = Api()
+    assert any(f["path"] == "Testordner" for f in api3.reorg_structure()["data"]["folders"])
+    api3.shutdown()
+
+
+def test_restart_during_reading_resumes(env, monkeypatch):
+    lib = env["lib"]
+    (lib / "Alt").mkdir()
+    for i in range(8):
+        text_pdf(lib / "Alt" / f"r{i}.pdf", ["Finanzamt", f"Steuerbescheid {i} vom 01.02.2026"])
+    api = make_api(env)
+    from app.docs import reader as rd
+    real = rd.read_document
+    seen = []
+
+    def slow(p, *a, **k):
+        import time as _t
+        _t.sleep(0.2)
+        seen.append(str(p))
+        return real(p, *a, **k)
+    monkeypatch.setattr("app.core.reorg.reader.read_document", slow)
+    api.reorg_start("neu")
+    assert wait_for(lambda: len(seen) >= 3, timeout=60)
+    api.reorg_pause()
+    assert wait_for(lambda: api.reorganizer.state.get("phase") == "paused", timeout=30)
+    assert api.reorganizer.state["paused_phase"] == "reading"
+    done_first = len(api.reorganizer.state.get("docs_partial", []))
+    api.shutdown()
+    from app.api import Api
+    api2 = Api()
+    seen.clear()
+    api2.reorg_resume()
+    assert wait_for(lambda: api2.reorganizer.state.get("phase") == "structure_review", timeout=120)
+    assert len(seen) == 9 - done_first
+    assert len(api2.reorganizer.state["docs"]) == 9
+    api2.shutdown()

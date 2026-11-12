@@ -125,9 +125,9 @@ def folder_examples(root: Path, folder: str, limit: int = 3) -> list[str]:
     return [p.name for p in files[:limit]]
 
 
-def folder_counts(root: Path) -> dict[str, int]:
+def folder_counts(root: Path, skip_photos: bool = True) -> dict[str, int]:
     counts: dict[str, int] = {}
-    for p in walk_documents(root, skip_photos=True):
+    for p in walk_documents(root, skip_photos=skip_photos):
         rel = p.parent.relative_to(root)
         key = "/".join(rel.parts)
         counts[key] = counts.get(key, 0) + 1

@@ -32,7 +32,8 @@ def output_suffix(kind: str, original: Path) -> str:
 def classify(ai, *, text: str, original: Path, kind: str, page_count: int,
              folders: list[str], folder_info: dict[str, dict], examples: list[dict],
              excluded: list[str] | None = None, allow_new: bool = True,
-             user_hints: list[str] | None = None, doc_hint: str = "") -> dict:
+             user_hints: list[str] | None = None, doc_hint: str = "",
+             folder_counts: dict[str, int] | None = None, new_only_below: bool = False) -> dict:
     """Schlägt Ordner, Dateinamen und Kurzbeschreibung vor.
 
     folder_info: Ordner -> {"scheme": str, "files": [Beispieldateinamen]}
@@ -47,6 +48,8 @@ def classify(ai, *, text: str, original: Path, kind: str, page_count: int,
         parts = [f]
         if info.get("scheme"):
             parts.append(f"Schema: {info['scheme']}")
+        if folder_counts and folder_counts.get(f):
+            parts.append(f"{folder_counts[f]} Dokumente")
         if info.get("files"):
             parts.append("z. B. " + "; ".join(info["files"][:3]))
         lines.append("- " + " — ".join(parts))
@@ -78,6 +81,8 @@ def classify(ai, *, text: str, original: Path, kind: str, page_count: int,
         user.append(f"HINWEIS DES NUTZERS ZU GENAU DIESEM DOKUMENT (hat Vorrang vor allem anderen): {doc_hint}")
     if not allow_new:
         user.append('Wähle unbedingt einen vorhandenen Ordner, nicht "__NEU__".')
+    elif new_only_below:
+        user.append('Neue Ordner ("__NEU__") nur als Unterordner eines vorhandenen Ordners aus der Liste.')
     type_label = {"pdf": "PDF", "image": "Bild/Scan", "office": "Office-Datei", "email": "E-Mail"}.get(kind, kind)
     user.append(f"Dokument (Typ: {type_label}, Originalname: {original.name}, Seiten: {page_count}):\n"
                 f"«{_doc_excerpt(text) or '(kein Text erkennbar)'}»")
@@ -91,11 +96,11 @@ def classify(ai, *, text: str, original: Path, kind: str, page_count: int,
 
     raw = ai.chat_json(prompts.CLASSIFY_SYSTEM, "\n\n".join(user), schema, "einordnung", max_tokens=400)
     return _postprocess(raw, original=original, kind=kind, folders=folders, excluded=excluded,
-                        allow_new=allow_new, examples=examples)
+                        allow_new=allow_new, examples=examples, new_only_below=new_only_below)
 
 
 def _postprocess(raw: dict, *, original: Path, kind: str, folders: list[str], excluded: list[str],
-                 allow_new: bool, examples: list[dict]) -> dict:
+                 allow_new: bool, examples: list[dict], new_only_below: bool = False) -> dict:
     lower_map = {f.lower(): f for f in folders}
     excluded_lower = {e.lower() for e in excluded}
     folder = str(raw.get("folder") or "")
@@ -105,9 +110,9 @@ def _postprocess(raw: dict, *, original: Path, kind: str, folders: list[str], ex
         candidate = naming.clean_folder(str(raw.get("new_folder") or ""))
         if candidate.lower() in lower_map and candidate.lower() not in excluded_lower:
             folder = lower_map[candidate.lower()]
-        elif candidate and allow_new and candidate.lower() not in lower_map:
-            # höchstens zwei Ebenen bei neuen Ordnern
-            folder = "/".join(candidate.split("/")[:2])
+        elif (candidate and allow_new and candidate.lower() not in lower_map
+              and (not new_only_below or "/".join(candidate.split("/")[:-1]).lower() in lower_map)):
+            folder = "/".join(candidate.split("/")[:3])  # höchstens drei Ebenen
             is_new = True
         else:
             # Die KI wollte einen abgelehnten Ordner „neu“ anlegen → nächstbesten nehmen
@@ -162,7 +167,8 @@ def _batches(items: list[str], budget: int = 9000) -> list[list[str]]:
     return out
 
 
-def build_taxonomy(ai, docs: list[dict], mode: str, existing: dict[str, int], on_progress=None) -> list[dict]:
+def build_taxonomy(ai, docs: list[dict], mode: str, existing: dict[str, int], on_progress=None,
+                   should_stop=None) -> list[dict]:
     """docs: [{"rel": "Ordner/Datei.pdf", "text": "..."}]; mode: "neu" oder "verbessern"."""
     lines = []
     for d in docs:
@@ -171,6 +177,8 @@ def build_taxonomy(ai, docs: list[dict], mode: str, existing: dict[str, int], on
     batches = _batches(lines)
     structure: list[dict] = []
     for i, batch in enumerate(batches, 1):
+        if should_stop and should_stop():
+            return structure
         parts = []
         if mode == "verbessern" and existing:
             parts.append("Vorhandene Ordner des Nutzers (mit Anzahl Dokumente). Behalte sinnvolle Ordner, "
@@ -197,19 +205,21 @@ def clean_structure(folders: list[dict]) -> list[dict]:
     seen, out = set(), []
     for f in folders:
         path = naming.clean_folder(str(f.get("path") or ""))
-        path = "/".join(path.split("/")[:2])
+        path = "/".join(path.split("/")[:3])
         if not path or path.lower() in seen:
             continue
         seen.add(path.lower())
         out.append({"path": path,
                     "scheme": str(f.get("scheme") or "JJJJ-MM Dokumentart").strip()[:80],
                     "example": naming.clean_part(str(f.get("example") or ""), "")[:80]})
-    # Hauptordner ergänzen, falls nur Unterordner genannt wurden
+    # Elternordner ergänzen, falls nur tiefere Ordner genannt wurden
     for f in list(out):
-        top = f["path"].split("/")[0]
-        if "/" in f["path"] and top.lower() not in seen:
-            seen.add(top.lower())
-            out.append({"path": top, "scheme": "JJJJ-MM Dokumentart", "example": ""})
+        parts = f["path"].split("/")
+        for depth in range(1, len(parts)):
+            parent = "/".join(parts[:depth])
+            if parent.lower() not in seen:
+                seen.add(parent.lower())
+                out.append({"path": parent, "scheme": "JJJJ-MM Dokumentart", "example": ""})
     out.sort(key=lambda f: f["path"].lower())
     return out
 

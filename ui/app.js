@@ -379,7 +379,12 @@ SCREENS.home = () => {
   }
 
   const rp = (st.reorg && st.reorg.phase) || "";
-  const reorgBanner = ["backup", "reading", "structure", "structure_review", "review"].includes(rp)
+  const rs = st.reorg || {};
+  const reorgBanner = rp === "paused"
+    ? `<div class="notice info">${I.layers(24)}<div class="grow"><b>Die Neuordnung ist pausiert.</b>
+       ${rs.total ? `Stand: ${rs.done.toLocaleString("de-DE")} von ${rs.total.toLocaleString("de-DE")}. ` : ""}Es geht genau dort weiter, wo sie stand.</div>
+       <button type="button" class="btn small violet" data-act="resumeReorg">Weitermachen</button></div>`
+    : ["backup", "reading", "structure", "structure_review", "review"].includes(rp)
     ? `<div class="notice info">${I.layers(24)}<div class="grow"><b>Die Neuordnung deiner Ablage läuft noch.</b>
        Du kannst jederzeit weitermachen.</div><button type="button" class="btn small violet" data-act="reorg">Weitermachen</button></div>` : "";
 
@@ -404,6 +409,7 @@ SCREENS.home = () => {
   S.actions = {
     startReview: () => startReview("inbox"),
     reorg: () => go("reorg"),
+    resumeReorg: async () => { const r = await tryCall("reorg_resume"); if (r) { S.state.reorg = r; go("reorg"); } },
     history: () => go("history"),
     settings: () => go("settings"),
   };
@@ -1327,6 +1333,7 @@ SCREENS.reorg = () => {
   const r = S.state.reorg || {};
   const phase = r.phase || "";
   if (["backup", "reading", "structure"].includes(phase)) return drawReorgProgress(r);
+  if (phase === "paused") return drawReorgPaused(r);
   if (phase === "structure_review") return drawStructure();
   if (phase === "review") return drawReorgHub(r);
   if (phase === "done" && S.reorgJustDone) return drawReorgDone(r);
@@ -1382,6 +1389,29 @@ function drawReorgIntro(r) {
   }).catch((e) => toast(e.message));
 }
 
+function drawReorgPaused(r) {
+  const label = { backup: "Sicherung anlegen", reading: "Dokumente lesen", structure: "Ordnerstruktur entwerfen" }[r.paused_phase] || "";
+  setHTML(`<div class="screen">${topbar("Zur Startseite", "back", "Ablage neu ordnen")}
+    <main class="wrap narrow">
+      <div class="stack g10"><h1 class="title">Die Neuordnung ist pausiert</h1>
+      <p class="lead">Alles, was schon erledigt ist, bleibt gespeichert – auch nach einem Neustart oder Update. Es geht genau dort weiter, wo sie stand.</p></div>
+      <section class="card big stack g16">
+        <span style="font-size:1.125rem;font-weight:600">Gerade dran: ${esc(label)}${r.total ? ` · ${r.done.toLocaleString("de-DE")} von ${r.total.toLocaleString("de-DE")}` : ""}</span>
+        <div class="progress"><div style="width:${r.total ? Math.round((r.done / r.total) * 100) : 0}%"></div></div>
+      </section>
+      <div class="row g12 wrapflex"><button type="button" class="btn primary tall shadow" data-act="resume">Weitermachen ${I.right()}</button>
+        <button type="button" class="btn link" data-act="cancel">Neuordnung abbrechen</button></div>
+    </main></div>`);
+  S.actions = {
+    back: () => go("home"),
+    resume: async () => { const st = await tryCall("reorg_resume"); if (st) { S.state.reorg = st; render(); } },
+    cancel: async () => {
+      const ok = await confirmDialog("Neuordnung abbrechen?", "Es wurde noch nichts verschoben. Die Sicherung bleibt erhalten.", "Abbrechen", true);
+      if (ok) { await tryCall("reorg_cancel"); await refreshState(); go("home"); }
+    },
+  };
+}
+
 function drawReorgProgress(r) {
   const phases = [["backup", "Sicherung anlegen"], ["reading", "Dokumente lesen"], ["structure", "Ordnerstruktur entwerfen"]];
   const idx = phases.findIndex((p) => p[0] === r.phase);
@@ -1403,10 +1433,12 @@ function drawReorgProgress(r) {
         ${r.detail && (r.phase === "reading" || r.phase === "backup") ? `<span class="small muted" style="overflow-wrap:anywhere">${esc(r.detail)}</span>` : ""}
         ${r.phase === "backup" ? `<span class="small muted">Dateien, die nur in der iCloud liegen, lade ich dabei herunter – das kann etwas dauern.</span>` : ""}
       </section>
-      <div><button type="button" class="btn" data-act="cancel">Abbrechen</button></div>
+      <div class="row g12 wrapflex"><button type="button" class="btn" data-act="pause">Pause – später weitermachen</button>
+        <button type="button" class="btn link" data-act="cancel">Abbrechen</button></div>
     </main></div>`);
   S.actions = {
     back: () => go("home"),
+    pause: async (el) => { el.disabled = true; el.textContent = "Wird pausiert …"; await tryCall("reorg_pause"); },
     cancel: async () => {
       const ok = await confirmDialog("Neuordnung abbrechen?", "Es wurde noch nichts verändert. Die Sicherung bleibt erhalten.", "Abbrechen", true);
       if (ok) { await tryCall("reorg_cancel"); await refreshState(); go("home"); }
@@ -1418,7 +1450,9 @@ function structToTree(folders) {
   const tops = [];
   const byName = {};
   folders.forEach((f) => {
-    const [top, sub] = f.path.split("/");
+    const parts = f.path.split("/");
+    const top = parts[0];
+    const sub = parts.slice(1).join("/");
     if (!byName[top]) { byName[top] = { name: top, scheme: "", example: "", subs: [] }; tops.push(byName[top]); }
     if (sub) byName[top].subs.push({ name: sub, scheme: f.scheme, example: f.example });
     else { byName[top].scheme = f.scheme; byName[top].example = f.example; }
@@ -1437,6 +1471,12 @@ function treeToStruct(tops) {
   return out;
 }
 
+let draftTimer = null;
+function saveDraft() {
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(() => { if (S.struct) tryCall("reorg_save_structure", treeToStruct(S.struct.tops)); }, 600);
+}
+
 function drawStructure() {
   if (!S.struct) {
     setHTML(`<div class="screen">${topbar("Zur Startseite", "back", "Ablage neu ordnen")}<div class="waiting"><div class="spinner"></div></div></div>`);
@@ -1452,7 +1492,7 @@ function drawStructure() {
         <input class="fname" value="${esc(t.name)}" aria-label="Ordnername" data-input="topName" data-t="${ti}">
         <button type="button" class="xbtn" data-act="delTop" data-t="${ti}" aria-label="Ordner entfernen" title="Ordner entfernen">${I.x(18)}</button></div>
       ${st.showEx && t.example && !t.subs.length ? `<span class="ex" style="padding-left:2.625rem">${esc(exName(t))}</span>` : ""}
-      <ul class="subs">${t.subs.map((s, si) => `<li><div class="row g4"><input class="fname subname" value="${esc(s.name)}" aria-label="Unterordner" data-input="subName" data-t="${ti}" data-s="${si}">
+      <ul class="subs">${t.subs.map((s, si) => `<li><div class="row g4"><input class="fname subname" value="${esc(s.name)}" aria-label="Unterordner (weitere Ebene mit /)" data-input="subName" data-t="${ti}" data-s="${si}">
         <button type="button" class="xbtn" data-act="delSub" data-t="${ti}" data-s="${si}" aria-label="Unterordner entfernen" title="Unterordner entfernen">${I.x(16)}</button></div>
         ${st.showEx && s.example ? `<span class="ex">${esc(exName(s))}</span>` : ""}</li>`).join("")}
         <li><button type="button" class="btn link small" style="align-self:flex-start;padding:0" data-act="addSub" data-t="${ti}">${I.plus(16)} Unterordner</button></li></ul>
@@ -1477,18 +1517,20 @@ function drawStructure() {
   S.actions = {
     back: () => go("home"),
     toggleEx: () => { st.showEx = !st.showEx; drawStructure(); },
-    topName: (el) => { st.tops[+el.dataset.t].name = el.value; },
-    subName: (el) => { st.tops[+el.dataset.t].subs[+el.dataset.s].name = el.value; },
-    delTop: (el) => { st.tops.splice(+el.dataset.t, 1); drawStructure(); },
-    delSub: (el) => { st.tops[+el.dataset.t].subs.splice(+el.dataset.s, 1); drawStructure(); },
+    topName: (el) => { st.tops[+el.dataset.t].name = el.value; saveDraft(); },
+    subName: (el) => { st.tops[+el.dataset.t].subs[+el.dataset.s].name = el.value; saveDraft(); },
+    delTop: (el) => { st.tops.splice(+el.dataset.t, 1); saveDraft(); drawStructure(); },
+    delSub: (el) => { st.tops[+el.dataset.t].subs.splice(+el.dataset.s, 1); saveDraft(); drawStructure(); },
     addSub: (el) => {
       st.tops[+el.dataset.t].subs.push({ name: "Neuer Unterordner", scheme: "JJJJ-MM Dokumentart", example: "" });
+      saveDraft();
       drawStructure();
       const ins = document.querySelectorAll(`[data-input=subName][data-t="${el.dataset.t}"]`);
       if (ins.length) { ins[ins.length - 1].focus(); ins[ins.length - 1].select(); }
     },
     addTop: () => {
       st.tops.push({ name: "Neuer Ordner", scheme: "JJJJ-MM Dokumentart", example: "", subs: [] });
+      saveDraft();
       drawStructure();
       const ins = document.querySelectorAll("[data-input=topName]");
       ins[ins.length - 1].focus(); ins[ins.length - 1].select();
@@ -1568,7 +1610,7 @@ async function init() {
   }
   if (!hasBridge()) startDevPolling();
   if (!S.state.settings.setup_done) go("setup");
-  else if (S.state.queue.total === 0 && S.state.reorg && ["backup", "reading", "structure", "structure_review", "review"].includes(S.state.reorg.phase)) go("reorg");
+  else if (S.state.queue.total === 0 && S.state.reorg && ["backup", "reading", "structure", "structure_review", "review", "paused"].includes(S.state.reorg.phase)) go("reorg");
   else go("home");
 }
 

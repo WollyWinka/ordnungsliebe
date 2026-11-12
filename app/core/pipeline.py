@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pymupdf
 
-from .. import paths
+from .. import jsonfile, paths
 from ..ai import tasks
 from ..ai.llm import LLMError
 from ..docs import ocr, preview, reader
@@ -58,6 +58,9 @@ class Pipeline:
         self.on_reorg_folder_added = None            # Rückruf: neuer Ordner während der Neuordnung
         self._worker = threading.Thread(target=self._work, name="analyse", daemon=True)
         self._poller = threading.Thread(target=self._poll, name="scan-ordner", daemon=True)
+        self._queue_file = paths.local_dir() / "warteschlange.json"
+        self._dirty = False
+        self._restore()
 
     # --- Start/Stopp --------------------------------------------------------------
     def start(self) -> None:
@@ -66,6 +69,56 @@ class Pipeline:
 
     def stop(self) -> None:
         self._stop.set()
+        self._persist()
+
+    # --- Zwischenspeichern ----------------------------------------------------------
+    _SKIP_KEYS = ("text", "page_texts", "fingerprint", "vec")
+
+    def _persist(self) -> None:
+        """Warteschlange samt fertiger Vorschläge sichern – übersteht Neustart und Update."""
+        with self._lock:
+            data = []
+            for it in self.items.values():
+                rec = {k: v for k, v in it.items() if k not in self._SKIP_KEYS}
+                try:
+                    st = Path(it["src"]).stat()
+                    rec["_size"], rec["_mtime"] = st.st_size, st.st_mtime
+                except OSError:
+                    continue
+                data.append(rec)
+            self._dirty = False
+        try:
+            jsonfile.save(self._queue_file, {"v": 1, "items": data})
+        except OSError:
+            log.warning("Warteschlange konnte nicht gespeichert werden")
+
+    def _restore(self) -> None:
+        saved = jsonfile.load(self._queue_file, {}).get("items", [])
+        restored = 0
+        for rec in saved:
+            src = Path(rec.get("src", ""))
+            try:
+                st = src.stat()
+            except OSError:
+                continue
+            if st.st_size != rec.get("_size") or abs(st.st_mtime - rec.get("_mtime", 0)) > 2:
+                continue  # Datei hat sich verändert → wird ohnehin neu erkannt
+            item = {k: v for k, v in rec.items() if not k.startswith("_")}
+            if item.get("sha"):
+                item["text"] = reader.cached_text(item["sha"]) or ""
+            if item.get("status") == "moving":
+                item["status"] = "ready"
+            needs_job = item.get("status") in ("waiting", "analyzing") or (
+                item.get("status") == "ready" and item.get("stage") == "doc" and not item.get("suggestion"))
+            if needs_job:
+                item["status"] = "waiting"
+            self.items[item["id"]] = item
+            if needs_job:
+                job = "classify" if item.get("text") else "analyze"
+                self._jobs.put((PRIO_NORMAL, next(self._seq), item["id"], job))
+            restored += 1
+        if restored:
+            log.info("%s Einträge der Warteschlange wiederhergestellt", restored)
 
     @property
     def settings(self):
@@ -77,6 +130,7 @@ class Pipeline:
 
     # --- Ereignisse ---------------------------------------------------------------
     def _changed(self) -> None:
+        self._dirty = True
         self.bus.emit("queue", self.overview())
 
     # --- Scan-Ordner beobachten ---------------------------------------------------
@@ -86,6 +140,8 @@ class Pipeline:
                 self._scan_inbox()
             except Exception:
                 log.exception("Fehler beim Prüfen des Scan-Ordners")
+            if self._dirty:
+                self._persist()
             self._stop.wait(POLL_SECONDS)
 
     def _scan_inbox(self) -> None:
@@ -235,20 +291,45 @@ class Pipeline:
             doc = reader.read_document(Path(item["src"]), sha=item.get("sha"))
             item.update(text=doc.text, page_count=doc.page_count, page_texts=doc.page_texts)
         if item["origin"] == "reorg":
-            folders, allow_new = list(self.reorg_folders), False
+            folders, allow_new, below = list(self.reorg_folders), True, True
         else:
-            folders, allow_new = library.list_folders(self.library_root), True
+            folders, allow_new, below = library.list_folders(self.library_root), True, False
         suggestion = tasks.classify(
             self.ai, text=item["text"], original=Path(item["src"]), kind=item["kind"],
             page_count=item["page_count"], folders=folders,
             folder_info=self._folder_info(folders, with_files=item["origin"] == "inbox"),
             examples=self.memory.similar(item["text"]), excluded=item["excluded"], allow_new=allow_new,
-            user_hints=self.hints.relevant(item["text"]), doc_hint=item.get("hint", ""))
+            user_hints=self.hints.relevant(item["text"]), doc_hint=item.get("hint", ""),
+            folder_counts=self.folder_counts(item["origin"]), new_only_below=below)
         suggestion["folder_display"] = naming.display_folder(suggestion["folder"])
         suggestion["alt_display"] = naming.display_folder(suggestion["alt_folder"])
         item.update(stage="doc", suggestion=suggestion, status="ready")
         if item["origin"] == "reorg":
             self._auto_keep_if_unchanged(item)
+
+    _counts_cache: tuple[float, dict] = (0.0, {})
+
+    def folder_counts(self, origin: str) -> dict[str, int]:
+        """Wie viele Dokumente liegen (oder landen) je Ordner? Hilft der KI, Unterordner vorzuschlagen."""
+        if origin == "reorg":
+            counts: dict[str, int] = {}
+            for e in self.history.group_entries(self.reorg_group):
+                if not e.get("undone"):
+                    counts[e.get("folder", "")] = counts.get(e.get("folder", ""), 0) + 1
+            with self._lock:
+                for it in self.items.values():
+                    s = it.get("suggestion")
+                    if it["origin"] == "reorg" and s:
+                        counts[s["folder"]] = counts.get(s["folder"], 0) + 1
+            return counts
+        ts, cached = self._counts_cache
+        if time.time() - ts > 120:
+            try:
+                cached = library.folder_counts(self.library_root, skip_photos=False) if self.library_root.is_dir() else {}
+            except Exception:
+                cached = {}
+            self._counts_cache = (time.time(), cached)
+        return cached
 
     def _auto_keep_if_unchanged(self, item: dict) -> None:
         src = Path(item["src"])

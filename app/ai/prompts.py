@@ -19,6 +19,7 @@ Regeln:
 - Ähnliche, vom Nutzer bereits bestätigte Fälle haben Vorrang vor deinem eigenen Gefühl.
 - "reason": ein bis zwei kurze deutsche Sätze, WARUM dieser Ordner passt (z. B. "Entgeltnachweis des Arbeitgebers; der Nutzer legt solche Nachweise in Arbeit/Gehalt/Entgeltnachweise ab."). Schreibe die Begründung, bevor du den Ordner wählst.
 - KORREKTUREN des Nutzers bei ähnlichen Fällen sind verbindlich: Ist das Dokument von derselben Art wie ein korrigierter Fall, wähle den Ordner aus der Korrektur – auch wenn ein übergeordneter Ordner ebenfalls passen würde. Ein spezieller Unterordner, den der Nutzer gewählt hat, schlägt immer den allgemeinen Ordner darüber.
+- UNTERORDNER: Hinter manchen Ordnern steht, wie viele Dokumente dort schon liegen. Ist der passende Ordner schon recht voll (ab etwa 20) und gehört das Dokument zu einer klar abgrenzbaren, wiederkehrenden Art (z. B. Entgeltnachweise, Kontoauszüge, Arztrechnungen, ein bestimmter Vertrag oder Anbieter), dann schlage einen neuen Unterordner DARUNTER vor ("__NEU__", z. B. new_folder "Arbeit/Gehalt/Entgeltnachweise"). Gibt es schon einen passenden Unterordner, nimm ihn statt des Oberordners. Keine Unterordner für Einzelstücke.
 - Hinweise des Nutzers haben Vorrang vor allem anderen. Ein Hinweis zu genau diesem Dokument gilt für Ordner UND Dateinamen; nennt er einen Ordner, der nicht in der Liste steht, wähle "__NEU__" und trage ihn in "new_folder" ein."""
 
 
@@ -41,15 +42,18 @@ def classify_schema(folders: list[str]) -> dict:
     }
 
 
-TAXONOMY_SYSTEM = """Du entwirfst eine übersichtliche Ordnerstruktur für die privaten Dokumente eines Haushalts in Deutschland.
+TAXONOMY_SYSTEM = """Du entwirfst eine übersichtliche, gut gegliederte Ordnerstruktur für die privaten Dokumente eines Haushalts in Deutschland.
+
+Ziel: Man soll jedes Dokument mit zwei, drei Klicks finden. Kein Ordner soll zur unübersichtlichen Sammelkiste werden.
 
 Regeln:
-- Höchstens zwei Ebenen: Hauptordner und Unterordner, getrennt mit "/" (z. B. "Versicherungen/Hausrat").
-- 5 bis 15 Hauptordner mit kurzen, allgemein verständlichen deutschen Namen (Umlaute erlaubt).
-- Keine Ordner für Jahreszahlen und keine Ordner für einzelne Dokumente. Ein Unterordner lohnt sich erst ab etwa drei passenden Dokumenten; sonst gehört das Dokument direkt in den Hauptordner.
+- 6 bis 14 Hauptordner mit kurzen, allgemein verständlichen deutschen Namen (Umlaute erlaubt), z. B. "Versicherungen", "Finanzen", "Wohnen", "Arbeit", "Gesundheit", "Fahrzeuge", "Familie", "Behörden", "Verträge", "Einkäufe & Garantien".
+- GLIEDERE GROSSZÜGIG IN UNTERORDNER: Jeder Hauptordner, in dem voraussichtlich mehr als etwa 8 Dokumente landen, bekommt Unterordner – nach Dokumentart, Vertrag/Anbieter, Objekt oder Person. Beispiele: "Versicherungen/Kfz", "Versicherungen/Hausrat", "Finanzen/Bank/Kontoauszüge", "Finanzen/Steuern/2025", "Arbeit/Gehalt/Entgeltnachweise", "Arbeit/Verträge & Zeugnisse", "Wohnen/Nebenkosten", "Gesundheit/Arztrechnungen".
+- Höchstens drei Ebenen (getrennt mit "/"). Die dritte Ebene nur, wenn es viele gleichartige Dokumente gibt (z. B. Kontoauszüge, Entgeltnachweise, Steuerjahre).
+- Ein Unterordner lohnt sich ab etwa drei passenden Dokumenten. Keine Ordner für Einzelstücke und keine reinen Jahresordner auf oberster Ebene.
 - Jeder Ordner bekommt ein Namensschema für Dateinamen ("scheme") und einen Beispiel-Dateinamen ohne Endung ("example").
   Grundsatz: Der Ordner sagt, was für ein Dokument es ist; der Dateiname sagt, welches. Meist steht das Datum vorn ("JJJJ-MM Dokumentart", Beispiel "2026-11 Beitragsrechnung"); bei Verträgen, Urkunden und Zeugnissen steht der Name vorn ("Mietvertrag Wohnung 2021-04").
-- Gib immer die vollständige Struktur aus, auch Ordner, die schon vorgegeben waren."""
+- Gib immer die vollständige Struktur aus, auch Ordner, die schon vorgegeben waren, und auch die Hauptordner selbst."""
 
 TAXONOMY_SCHEMA = {
     "type": "object",
