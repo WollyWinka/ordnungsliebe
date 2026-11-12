@@ -125,6 +125,7 @@ def main():
             shot("08b-sammelliste-gruppe-aus")
             page.click(".bgroup-check input")
             page.wait_for_timeout(300)
+            page.click("h1")  # Fokus weg vom Kästchen, dann Enter = einsortieren
             page.keyboard.press("Enter")
             page.wait_for_timeout(2000)
             shot("09-einzelpruefung")

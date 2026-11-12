@@ -65,16 +65,25 @@ class LlamaServer:
 
     # --- Lebenszyklus -------------------------------------------------------------
     def _kill_stale(self) -> None:
+        """Beendet ein übrig gebliebenes KI-Programm – aber nur, wenn es wirklich llama-server ist."""
         try:
             pid = int(self._pidfile.read_text().strip())
         except (OSError, ValueError):
             return
         try:
             if paths.IS_WINDOWS:
-                subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True,
-                               creationflags=CREATE_NO_WINDOW)
+                out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True,
+                                     text=True, creationflags=CREATE_NO_WINDOW).stdout.lower()
+                if "llama-server" in out:
+                    subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True,
+                                   creationflags=CREATE_NO_WINDOW)
             else:
-                os.kill(pid, 15)
+                try:
+                    cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+                except OSError:
+                    cmdline = b""
+                if b"llama-server" in cmdline:
+                    os.kill(pid, 15)
         except Exception:
             pass
         self._pidfile.unlink(missing_ok=True)
@@ -86,6 +95,8 @@ class LlamaServer:
         with self._lock:
             if self.running() and self.model_id == model_id:
                 return
+            if time.monotonic() - getattr(self, "_failed_at", -1e9) < 120:
+                raise LLMError("Die KI konnte nicht gestartet werden. Ich versuche es gleich noch einmal.")
             self._stop_locked()
             spec = models.get(model_id)
             if spec is None or not spec.installed:
@@ -102,6 +113,8 @@ class LlamaServer:
                     self.model_id, self.gpu = model_id, gpu
                     self.on_status("ready", spec.label)
                     return
+            self._pidfile.unlink(missing_ok=True)
+            self._failed_at = time.monotonic()
             self.on_status("error", "")
             raise LLMError("Die KI konnte nicht gestartet werden.")
 

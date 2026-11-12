@@ -33,6 +33,27 @@ def _trash(path: Path) -> Path:
     return library.quarantine(path)
 
 
+def _locked(p: Path) -> bool:
+    """Ist die Datei gerade von einem anderen Programm zum Schreiben geöffnet?
+
+    Schreibgeschützte Dateien lassen sich nicht mit „rb+“ öffnen – dann reicht der Lesetest.
+    """
+    try:
+        with open(p, "rb+"):
+            return False
+    except PermissionError:
+        try:
+            import stat as _stat
+            if not (p.stat().st_mode & _stat.S_IWRITE):
+                with open(p, "rb"):
+                    return False
+        except OSError:
+            return True
+        return True
+    except OSError:
+        return True
+
+
 class Pipeline:
     def __init__(self, settings_store, ai, memory, history, dupindex, schemes, bus, hints=None, ignored=None,
                  docmeta=None):
@@ -59,6 +80,7 @@ class Pipeline:
         self._ignored_inbox: set[str] = set()
         self.reorg_folders: list[str] = []          # erlaubte Ordner während einer Neuordnung
         self.reorg_group: str = ""
+        self.reorg_kept: set[str] = set()           # Neuordnung: Dokumente, die schon richtig liegen
         self.on_reorg_folder_added = None            # Rückruf: neuer Ordner während der Neuordnung
         self.on_filed = None                         # Rückruf: Dokument wurde abgelegt (für die Suche)
         self._worker = threading.Thread(target=self._work, name="analyse", daemon=True)
@@ -102,12 +124,14 @@ class Pipeline:
             except OSError:
                 data.remove(rec)
         try:
-            jsonfile.save(self._queue_file, {"v": 1, "items": data})
+            jsonfile.save(self._queue_file, {"v": 1, "items": data, "kept": sorted(self.reorg_kept)})
         except Exception:
             log.warning("Warteschlange konnte nicht gespeichert werden")
 
     def _restore(self) -> None:
-        saved = jsonfile.load(self._queue_file, {}).get("items", [])
+        raw = jsonfile.load(self._queue_file, {})
+        self.reorg_kept = set(raw.get("kept", []))
+        saved = raw.get("items", [])
         restored = 0
         for rec in saved:
             src = Path(rec.get("src", ""))
@@ -188,10 +212,7 @@ class Pipeline:
                 continue
             if now - prev[1] < 2 or size == 0:
                 continue
-            try:  # Scanner noch am Schreiben? Dann ist die Datei meist gesperrt.
-                with open(p, "rb+"):
-                    pass
-            except OSError:
+            if _locked(p):  # Scanner noch am Schreiben? Dann ist die Datei meist gesperrt.
                 continue
             self._seen_sizes.pop(sp, None)
             self.add_file(p, origin="inbox")
@@ -370,6 +391,8 @@ class Pipeline:
         if s["folder"] == current and s["filename"] == src.name:
             with self._lock:
                 self.items.pop(item["id"], None)
+                self.reorg_kept.add(str(src))
+                self._dirty = True
             self.memory.add(item.get("text", ""), current, src.name, ref="", original_name=src.name)
             self._record_meta(item, src, current, s)
 
@@ -748,11 +771,23 @@ class Pipeline:
         inbox = src.parent
         parts = []
         with self._lock:
-            for b in built:
-                dst = library.move_file(b, inbox / b.name)
-                self._split_parts.add(str(dst))
-                parts.append(dst)
-            kept = _trash(src)
+            try:
+                for b in built:
+                    dst = library.move_file(b, naming.unique_path(inbox / b.name))
+                    self._split_parts.add(str(dst))
+                    parts.append(dst)
+                kept = _trash(src)
+            except Exception:
+                # z. B. Original gerade von Virenscanner/Vorschau gesperrt → Teile wieder entfernen
+                for p in parts:
+                    try:
+                        p.unlink()
+                    except OSError:
+                        log.warning("Teil konnte nicht zurückgenommen werden: %s", p)
+                    self._split_parts.discard(str(p))
+                item["status"] = "ready"
+                raise RuntimeError("Die Datei ist gerade von einem anderen Programm geöffnet. "
+                                   "Bitte schließe es und versuche es noch einmal.")
             self.history.add("split", str(src), str(kept), "", parts=[str(p) for p in parts])
             self.items.pop(item_id, None)
             for p in parts:
@@ -762,6 +797,9 @@ class Pipeline:
 
     def remove_origin(self, origin: str) -> None:
         with self._lock:
+            if origin == "reorg":
+                self.reorg_kept.clear()
+                self._dirty = True
             for iid in [i for i, it in self.items.items() if it["origin"] == origin]:
                 self.items.pop(iid, None)
         self._changed()

@@ -7,7 +7,10 @@ import email.policy
 import hashlib
 import logging
 import re
+import shutil
 import subprocess
+import tempfile
+import threading
 from email.utils import parsedate_to_datetime
 from html import unescape
 from pathlib import Path
@@ -72,6 +75,9 @@ def _prepare_lo_profile() -> None:
         xcu.write_text(content, encoding="utf-8")
 
 
+_LO_LOCK = threading.Lock()
+
+
 def office_to_pdf(path: Path, timeout: int = 90) -> Path | None:
     """Wandelt eine Office-Datei mit dem mitgelieferten LibreOffice in ein PDF um (zwischengespeichert)."""
     soffice = paths.soffice_path()
@@ -82,27 +88,33 @@ def office_to_pdf(path: Path, timeout: int = 90) -> Path | None:
     target = out_dir / f"{_file_key(path)}.pdf"
     if target.exists():
         return target
-    work = out_dir / "arbeit"
-    work.mkdir(exist_ok=True)
-    try:
-        _prepare_lo_profile()
-    except OSError:
-        log.warning("LibreOffice-Profil konnte nicht vorbereitet werden")
-    profile = paths.lo_profile_dir().as_uri()
-    cmd = [str(soffice), f"-env:UserInstallation={profile}", "--headless", "--norestore",
-           "--convert-to", "pdf", "--outdir", str(work), str(path)]
-    try:
-        kwargs = {"creationflags": CREATE_NO_WINDOW} if paths.IS_WINDOWS else {}
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       timeout=timeout, check=False, **kwargs)
-    except (subprocess.TimeoutExpired, OSError):
-        log.exception("LibreOffice-Umwandlung fehlgeschlagen")
-        return None
-    produced = work / (path.stem + ".pdf")
-    if produced.exists():
-        produced.replace(target)
-        return target
-    return None
+    # Ein LibreOffice zur Zeit (gemeinsames Profil), eigener Arbeitsordner je Umwandlung
+    with _LO_LOCK:
+        if target.exists():
+            return target
+        work = Path(tempfile.mkdtemp(prefix="arbeit-", dir=str(out_dir)))
+        try:
+            try:
+                _prepare_lo_profile()
+            except OSError:
+                log.warning("LibreOffice-Profil konnte nicht vorbereitet werden")
+            profile = paths.lo_profile_dir().as_uri()
+            cmd = [str(soffice), f"-env:UserInstallation={profile}", "--headless", "--norestore",
+                   "--convert-to", "pdf", "--outdir", str(work), str(path)]
+            try:
+                kwargs = {"creationflags": CREATE_NO_WINDOW} if paths.IS_WINDOWS else {}
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=timeout, check=False, **kwargs)
+            except (subprocess.TimeoutExpired, OSError):
+                log.exception("LibreOffice-Umwandlung fehlgeschlagen")
+                return None
+            produced = work / (path.stem + ".pdf")
+            if produced.exists():
+                produced.replace(target)
+                return target
+            return None
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 def office_text_fallback(path: Path) -> str:

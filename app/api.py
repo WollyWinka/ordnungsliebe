@@ -34,9 +34,13 @@ def api_method(fn):
         try:
             return {"ok": True, "data": fn(self, *args, **kwargs)}
         except (ValueError, KeyError, FileNotFoundError, RuntimeError) as exc:
-            msg = exc.args[0] if exc.args else str(exc)
-            log.warning("%s: %s", fn.__name__, msg)
-            return {"ok": False, "error": str(msg)}
+            msg = exc.args[0] if exc.args else ""
+            log.warning("%s: %r", fn.__name__, exc)
+            if not isinstance(msg, str) or " " not in msg.strip():
+                # keine verständliche Meldung (z. B. Fehlernummer oder interner Schlüssel)
+                msg = ("Die Datei oder der Ordner ist nicht mehr da." if isinstance(exc, FileNotFoundError)
+                       else "Da ist etwas schiefgegangen. Bitte versuche es noch einmal.")
+            return {"ok": False, "error": msg}
         except Exception:
             log.exception("Fehler in %s", fn.__name__)
             return {"ok": False, "error": "Da ist etwas schiefgegangen. Bitte versuche es noch einmal."}
@@ -173,6 +177,21 @@ class Api:
     def reorg_active(self) -> bool:
         return self.reorganizer.state.get("phase") in reorg.ACTIVE
 
+    def _moved_back(self, old: Path, new: Path) -> None:
+        """Rückgängig gemacht: Fristen, Mappen und Suche zeigen wieder auf den alten Ort."""
+        try:
+            self.docmeta.moved(str(old), str(new))
+            sha = self.search_index.sha_for_path(str(old)) or ""
+            self.search_index.remove(str(old))
+            root = self.library_root()
+            if root and sha:
+                from .docs import reader as _r
+                text = _r.cached_text(sha)
+                if text is not None:
+                    self.search_index.put(new, root=root, sha=sha, text=text, extra=self._meta_extra(sha))
+        except Exception:
+            log.exception("Verweise nach Rückgängig nicht aktualisiert")
+
     def on_inspected(self, p: Path, sha: str, text: str) -> None:
         root = self.library_root()
         if root:
@@ -203,13 +222,18 @@ class Api:
                 continue
             if (info.get("cleaned") or {}).get("removed"):
                 continue  # Seiten wurden entfernt → Original bleibt dauerhaft
-            if not reorg._unchanged(Path(e["dst"]), e):
-                continue  # abgelegte Fassung fehlt oder wurde verändert → Original ist die einzige Kopie
             p = Path(orig)
             try:
-                if p.is_file() and p.resolve().parent == store:
-                    p.unlink()
-                    removed += 1
+                if not p.is_file() or p.resolve().parent != store:
+                    continue  # schon aufgeräumt
+            except OSError:
+                continue
+            dst = Path(e["dst"])
+            if library.is_cloud_only(dst) or not reorg._unchanged(dst, e):
+                continue  # abgelegte Fassung nicht prüfbar, fehlt oder wurde verändert → Original behalten
+            try:
+                p.unlink()
+                removed += 1
             except OSError:
                 pass
         return removed
@@ -254,8 +278,9 @@ class Api:
                 root = Path(lib)
                 st = self.search_index.status
                 st.update(running=True, done=0, total=0, pending=0)
-                files = list(library.walk_documents(root, include_cloud_only=False, skip_photos=True))
-                current = {str(p) for p in files}
+                everything = list(library.walk_documents(root, include_cloud_only=True, skip_photos=True))
+                current = {str(p) for p in everything}  # Cloud-Dateien bleiben im Index (Text ist bekannt)
+                files = [p for p in everything if not library.is_cloud_only(p)]
                 for old in self.search_index.paths():
                     if old not in current:
                         self.search_index.remove(old)
@@ -335,6 +360,13 @@ class Api:
 
     def shutdown(self) -> None:
         self._stopping.set()
+        try:  # laufende Neuordnung sauber pausieren, damit sie nach dem Neustart weitergeht
+            self.reorganizer.pause()
+            t = self.reorganizer._thread
+            if t is not None and t is not threading.current_thread():
+                t.join(timeout=5)
+        except Exception:
+            log.exception("Neuordnung konnte beim Beenden nicht pausiert werden")
         for bg in (self.inspector, self.refiner):
             try:
                 bg._stop.set()
@@ -965,12 +997,13 @@ class Api:
             self.pipeline._ignored_inbox.discard(entry["src"])
             self.history.mark_undone(entry_id)
             return {"where": setup.pretty_path(entry["src"]), "ignore": True}
-        where = reorg.undo_entry(entry, self.settings_store.get(), self.history, self.memory, self.dup)
+        where = reorg.undo_entry(entry, self.settings_store.get(), self.history, self.memory, self.dup,
+                                 moved=self._moved_back)
         return {"where": setup.pretty_path(where)}
 
     @api_method
     def undo_reorg(self, group_id: str):
-        return reorg.undo_group(group_id, self.history, self.memory, self.dup)
+        return reorg.undo_group(group_id, self.history, self.memory, self.dup, moved=self._moved_back)
 
     # --- Neuordnung ---------------------------------------------------------------------
     @api_method
@@ -1037,8 +1070,7 @@ class Api:
     @api_method
     def delete_backup(self, backup_id: str):
         st = self.reorganizer.state
-        if st.get("group") == backup_id and st.get("phase") in ("backup", "reading", "structure",
-                                                                "structure_review", "review"):
+        if st.get("group") == backup_id and st.get("phase") in reorg.ACTIVE:
             raise ValueError("Diese Sicherung gehört zur laufenden Neuordnung und kann erst danach gelöscht werden.")
         return self.backups.remove(backup_id)
 

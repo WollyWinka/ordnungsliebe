@@ -167,6 +167,7 @@ class Reorganizer:
                              f"„{lib}“ oder brich die Neuordnung ab.")
         phase = self.state.get("paused_phase", "backup")
         self.state["phase"] = phase
+        self.state["error"] = ""
         self._save()
         self._launch(phase)
         return self.status()
@@ -211,10 +212,24 @@ class Reorganizer:
             if self._stopped("structure"):
                 return
         except (LLMError, OcrUnavailable, ReorgError) as exc:
-            log.warning("Neuordnung abgebrochen: %s", exc)
+            cur = self.state.get("phase", phase)
+            if self._cancel.is_set() and cur in RUNNING:
+                self._stopped(cur)  # Pause/Beenden während die KI antwortete → einfach pausiert
+                return
+            log.warning("Neuordnung angehalten: %s", exc)
+            if isinstance(exc, (LLMError, OcrUnavailable)) and cur in RUNNING:
+                # vorübergehendes Problem: pausieren, damit es später weitergehen kann
+                self.state["paused_phase"] = cur
+                self.state["error"] = str(exc)
+                self._progress("paused", self.state.get("done", 0), self.state.get("total", 0))
+                return
             self.state["error"] = str(exc)
             self._progress("error", detail="")
         except Exception as exc:
+            cur = self.state.get("phase", phase)
+            if self._cancel.is_set() and cur in RUNNING:
+                self._stopped(cur)
+                return
             log.exception("Neuordnung fehlgeschlagen")
             self.state["error"] = "Bei der Neuordnung ist ein Fehler aufgetreten. Deine Dateien sind unverändert."
             self._progress("error", detail=f"{type(exc).__name__}: {exc}"[:300])
@@ -410,7 +425,7 @@ class Reorganizer:
         queued = {it["src"] for it in self.pipeline.items.values() if it["origin"] == "reorg"}
         for d in self.state.get("docs", []):
             p = Path(d["path"])
-            if d["path"] in done or d["path"] in queued or not p.exists():
+            if d["path"] in done or d["path"] in queued or d["path"] in self.pipeline.reorg_kept or not p.exists():
                 continue
             self.pipeline.add_file(p, origin="reorg", group=self.state["group"], sha=d.get("sha"))
 
@@ -446,7 +461,7 @@ def _unchanged(path: Path, entry: dict) -> bool:
     return True
 
 
-def undo_entry(entry: dict, settings, history, memory, dup) -> str:
+def undo_entry(entry: dict, settings, history, memory, dup, moved=None) -> str:
     """Macht einen Verlaufseintrag rückgängig. Gibt den neuen Ort zurück.
 
     Vorher wird geprüft, dass am Ablageort noch genau dieselbe Datei liegt. Nichts wird gelöscht:
@@ -482,13 +497,15 @@ def undo_entry(entry: dict, settings, history, memory, dup) -> str:
     else:
         back = library.move_file(dst, src)
         dup.move(dst, back)
+        if moved:
+            moved(dst, back)
     dup.save()
     memory.remove_ref(entry["id"])
     history.mark_undone(entry["id"])
     return str(back)
 
 
-def undo_group(gid: str, history, memory, dup) -> dict:
+def undo_group(gid: str, history, memory, dup, moved=None) -> dict:
     """Macht eine komplette Neuordnung rückgängig (Datei für Datei, in umgekehrter Reihenfolge).
 
     Dateien, die inzwischen verändert oder weiterverschoben wurden, bleiben, wo sie sind, und
@@ -515,6 +532,8 @@ def undo_group(gid: str, history, memory, dup) -> dict:
                 src.parent.mkdir(parents=True, exist_ok=True)
                 back = library.move_file(dst, src)
                 dup.move(dst, back)
+                if moved:
+                    moved(dst, back)
             history.mark_undone(entry["id"])
             memory.remove_ref(entry["id"])
             created += entry.get("info", {}).get("created_dirs", [])

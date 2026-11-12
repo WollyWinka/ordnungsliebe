@@ -116,6 +116,8 @@ def read_document(path: Path, sha: str | None = None, use_cache: bool = True) ->
         else:
             text = office.office_text_fallback(path)
             result = DocText(kind, text, [text], 1, sha256=sha)
+            if not text.strip():
+                return result  # Umwandlung fehlgeschlagen → nicht merken, beim nächsten Mal neu versuchen
     else:  # email
         view = office.parse_email(path)
         text = office.email_text(view)

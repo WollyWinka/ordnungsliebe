@@ -44,18 +44,7 @@ def classify(ai, *, text: str, original: Path, kind: str, page_count: int,
     excluded = [f for f in (excluded or []) if f]
     allowed = [f for f in folders if f not in excluded]
 
-    lines = []
-    for f in allowed:
-        info = folder_info.get(f, {})
-        parts = [f]
-        if info.get("scheme"):
-            parts.append(f"Schema: {info['scheme']}")
-        if folder_counts and folder_counts.get(f):
-            parts.append(f"{folder_counts[f]} Dokumente")
-        if info.get("files"):
-            parts.append("z. B. " + "; ".join(info["files"][:3]))
-        lines.append("- " + " — ".join(parts))
-    folder_block = "\n".join(lines) if lines else "(noch keine Ordner vorhanden)"
+    folder_block = _folder_block(allowed, folder_info, folder_counts, {e.get("folder") for e in examples or []})
 
     user = [f"Ordnerstruktur:\n{folder_block}"]
     if examples:
@@ -110,6 +99,33 @@ def classify(ai, *, text: str, original: Path, kind: str, page_count: int,
     return out
 
 
+FOLDER_BLOCK_BUDGET = 9000  # Zeichen – damit die Anfrage sicher in den KI-Kontext (8192 Token) passt
+
+
+def _folder_block(allowed: list[str], folder_info: dict, folder_counts: dict | None, keep_detail: set) -> str:
+    """Ordnerliste für die KI; bei sehr vielen Ordnern mit weniger Details, damit nichts überläuft."""
+    if not allowed:
+        return "(noch keine Ordner vorhanden)"
+
+    def line(f: str, level: int) -> str:
+        info = folder_info.get(f, {})
+        parts = [f]
+        if level >= 1 and info.get("scheme"):
+            parts.append(f"Schema: {info['scheme']}")
+        if level >= 1 and folder_counts and folder_counts.get(f):
+            parts.append(f"{folder_counts[f]} Dokumente")
+        if level >= 2 and info.get("files"):
+            parts.append("z. B. " + "; ".join(info["files"][:3]))
+        return "- " + " — ".join(parts)
+
+    for level in (2, 1, 0):
+        lines = [line(f, 2 if f in keep_detail else level) for f in allowed]
+        text = "\n".join(lines)
+        if len(text) <= FOLDER_BLOCK_BUDGET:
+            return text
+    return "\n".join(line(f, 0) for f in allowed)[:FOLDER_BLOCK_BUDGET * 2]
+
+
 def clean_deadlines(raw) -> list[dict]:
     """Nur gültige Daten (JJJJ-MM-TT), plausibler Zeitraum, höchstens drei, ohne Doppelte."""
     out, seen = [], set()
@@ -144,6 +160,7 @@ def _postprocess(raw: dict, *, original: Path, kind: str, folders: list[str], ex
     folder = str(raw.get("folder") or "")
     alt = str(raw.get("alternative_folder") or "")
     is_new = False
+    guessed = False
     if folder == prompts.NEW_FOLDER or folder not in folders or folder in excluded:
         candidate = naming.clean_folder(str(raw.get("new_folder") or ""))
         if candidate.lower() in lower_map and candidate.lower() not in excluded_lower:
@@ -153,11 +170,20 @@ def _postprocess(raw: dict, *, original: Path, kind: str, folders: list[str], ex
             folder = "/".join(candidate.split("/")[:3])  # höchstens drei Ebenen
             is_new = True
         else:
-            # Die KI wollte einen abgelehnten Ordner „neu“ anlegen → nächstbesten nehmen
-            fallback = ([alt] if alt in folders and alt not in excluded else []) + \
-                       [f for f in folders if f not in excluded]
+            # Kein brauchbarer Ordner: Elternordner des Vorschlags, sonst Alternative – aber nie „sicher“
+            fallback = []
+            parts = candidate.split("/") if candidate else []
+            for n in range(len(parts) - 1, 0, -1):
+                parent = "/".join(parts[:n]).lower()
+                if parent in lower_map and parent not in excluded_lower:
+                    fallback.append(lower_map[parent])
+                    break
+            if alt in folders and alt not in excluded:
+                fallback.append(alt)
+            fallback += [f for f in folders if f not in excluded]
             folder = fallback[0] if fallback else "Sonstiges"
             is_new = folder not in folders
+            guessed = True
     if alt not in folders or alt == folder or alt in excluded:
         alt = ""
 
@@ -172,6 +198,8 @@ def _postprocess(raw: dict, *, original: Path, kind: str, folders: list[str], ex
                 score -= 0.25 if top.get("corrected") else 0.15
     if is_new:
         score = min(score, 0.7)
+    if guessed:
+        score = min(score, 0.4)  # muss einzeln geprüft werden
     if excluded:
         score = min(score, 0.79)
     score = max(0.05, min(score, 0.99))

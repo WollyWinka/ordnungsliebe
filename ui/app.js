@@ -429,6 +429,7 @@ const HANDLERS = {
   reorg(p) {
     if (!S.state) return;
     S.state.reorg = p;
+    if (!["backup", "reading", "structure"].includes(p.phase)) S.reorgPausing = false;
     if (S.route === "reorg" || S.route === "home") softRender();
   },
   reorg_item_done() { /* über queue abgedeckt */ },
@@ -919,7 +920,7 @@ function drawRefine() {
       <div class="footbar"><button type="button" class="btn link" data-act="cancel">Verwerfen</button>
         <button type="button" class="btn primary tall" data-act="apply" ${total ? "" : "disabled"}>${I.check()} ${plural(total, "Dokument", "Dokumente")} verschieben</button></div>`);
     Object.assign(S.actions, {
-      toggleDoc: (el) => { const i = +el.dataset.i; if (el.checked) R.off.delete(i); else R.off.add(i); drawRefine(); },
+      toggleDoc: (el) => { const i = +el.dataset.i; if (el.checked) R.off.delete(i); else R.off.add(i); drawRefine(); refocus(`[data-change="toggleDoc"][data-i="${i}"]`); },
       openSub: (el) => { const si = +el.dataset.si; if (R.open.has(si)) R.open.delete(si); else R.open.add(si); drawRefine(); },
       rename: (el) => { R.names[el.dataset.name] = el.value; },
       apply: async (el) => {
@@ -1045,6 +1046,11 @@ SCREENS.batch = () => {
   }).catch((e) => toast(e.message));
 };
 
+function refocus(selector) {
+  const el = document.querySelector(selector);
+  if (el) el.focus({ preventScroll: true });
+}
+
 function batchGroups(items) {
   const map = new Map();
   for (const it of items) {
@@ -1099,14 +1105,15 @@ function drawBatch() {
   document.querySelectorAll("[data-mixed]").forEach((el) => { el.indeterminate = true; });
   S.actions = {
     back: backFn,
-    toggle: (el) => { const id = el.dataset.id; if (el.checked) off.delete(id); else off.add(id); drawBatch(); },
+    toggle: (el) => { const id = el.dataset.id; if (el.checked) off.delete(id); else off.add(id); drawBatch(); refocus(`[data-change="toggle"][data-id="${id}"]`); },
     toggleGroup: (el) => {
       const g = groups[+el.dataset.g];
       const allOn = g.items.every((i) => !off.has(i.id));
       for (const i of g.items) { if (allOn) off.add(i.id); else off.delete(i.id); }
       drawBatch();
+      refocus(`[data-change="toggleGroup"][data-g="${el.dataset.g}"]`);
     },
-    openGroup: (el) => { const k = groups[+el.dataset.g].key; if (open.has(k)) open.delete(k); else open.add(k); drawBatch(); },
+    openGroup: (el) => { const k = groups[+el.dataset.g].key; if (open.has(k)) open.delete(k); else open.add(k); drawBatch(); refocus(`[data-act="openGroup"][data-g="${el.dataset.g}"]`); },
     goSingle: async () => { await tryCall("decline_batch", [...off]); go("single", { origin }); },
     go: async (el) => {
       el.disabled = true;
@@ -1144,11 +1151,20 @@ function singleOnQueue() {
   const c = S.cur;
   if (!c) return;
   if (c.waitingFor) {
-    call("item", c.waitingFor).then((it) => {
+    const wid = c.waitingFor;
+    if (c.polling) return;  // schon eine Anfrage unterwegs
+    c.polling = true;
+    call("item", wid).then((it) => {
+      c.polling = false;
+      if (S.route !== "single" || S.cur !== c || c.waitingFor !== wid) return;
       if (it.status === "ready" || it.status === "error") {
         c.item = it; c.waitingFor = null; c.editName = false; drawSingle(); loadPreview();
       }
-    }).catch(() => { c.waitingFor = null; loadNextSingle(); });
+    }).catch(() => {
+      c.polling = false;
+      if (S.route !== "single" || S.cur !== c || c.waitingFor !== wid) return;
+      c.waitingFor = null; loadNextSingle();
+    });
   } else if (!c.item && !c.loading) {
     loadNextSingle();
   } else if (!c.item) {
@@ -1160,17 +1176,20 @@ async function loadPreview() {
   const c = S.cur;
   if (!c || !c.item) return;
   const id = c.item.id;
+  const page = c.page;
+  const current = () => S.route === "single" && S.cur === c && c.item && c.item.id === id;
   if (c.item.stage === "stack") {
     const thumbs = await tryCall("thumbs", id);
-    if (S.cur && S.cur.item && S.cur.item.id === id) { S.cur.thumbs = thumbs || []; drawSingle(); }
+    if (current()) { c.thumbs = thumbs || []; drawSingle(); }
     return;
   }
-  const pv = await tryCall("preview", id, c.page);
-  if (!S.cur || !S.cur.item || S.cur.item.id !== id) return;
-  S.cur.preview = pv;
+  const pv = await tryCall("preview", id, page);
+  if (!current() || c.page !== page) return;  // inzwischen woanders oder andere Seite
+  c.preview = pv;
   if (c.item.stage === "duplicate" && c.item.dup) {
     const other = await tryCall("preview_path", c.item.dup.path, 0);
-    if (S.cur && S.cur.item && S.cur.item.id === id) S.cur.dupPreview = other;
+    if (!current()) return;
+    c.dupPreview = other;
   }
   drawSingle();
 }
@@ -1311,7 +1330,7 @@ function drawSingle() {
       if (res) { toast(`Abgelegt in ${res.folder_display}`); loadNextSingle(); }
     },
     confirm: async (el) => {
-      if (c.editName) S.actions.saveName();
+      if (c.editName) { S.actions.saveName(); el = document.querySelector('[data-act="confirm"]') || el; }
       el.disabled = true;
       const s = it.suggestion;
       const res = await tryCall("confirm", it.id, s.folder, s.filename, { deadlines: s.deadlines || [], person: s.person || "" });
@@ -1366,6 +1385,19 @@ function drawSingle() {
       }
     },
   });
+}
+
+// Gegen doppeltes Auslösen (Doppelklick, Taste zweimal): solange eine Aktion läuft, keine zweite.
+function guardActions(c, names) {
+  for (const k of names) {
+    const f = S.actions[k];
+    if (!f) continue;
+    S.actions[k] = async (el, ev) => {
+      if (c.busy) return;
+      c.busy = true;
+      try { await f(el, ev); } finally { c.busy = false; }
+    };
+  }
 }
 
 function personRow(s) {
@@ -1481,10 +1513,10 @@ function drawStack() {
     split: async (el) => {
       el.disabled = true;
       const n2 = await tryCall("split", it.id, [...c.starts]);
-      if (n2) toast(`In ${n2} Dokumente aufgeteilt.`);
-      loadNextSingle();
+      if (n2) { toast(`In ${n2} Dokumente aufgeteilt.`); loadNextSingle(); } else el.disabled = false;
     },
   };
+  guardActions(c, ["single", "split"]);
 }
 
 /* ---------- Doppeltes Dokument ---------- */
@@ -1516,8 +1548,9 @@ function drawDuplicate() {
   S.actions = {
     back: backFn,
     keep: async () => { await tryCall("dup_keep", it.id); c.waitingFor = it.id; c.item.stage = "doc"; c.item.status = "waiting"; c.preview = null; drawSingle(); loadPreview(); },
-    trash: async () => { if (await tryCall("dup_trash", it.id)) toast("Zur Seite gelegt – im Verlauf kannst du ihn zurückholen."); loadNextSingle(); },
+    trash: async () => { if (await tryCall("dup_trash", it.id)) { toast("Zur Seite gelegt – im Verlauf kannst du ihn zurückholen."); loadNextSingle(); } },
   };
+  guardActions(c, ["keep", "trash"]);
 }
 
 /* ---------- Verlauf ---------- */
@@ -1592,7 +1625,7 @@ function loadHints() {
       <p class="small muted">Diese Hinweise gebe ich der KI mit. Du kannst sie ändern (einfach hineinklicken) oder löschen.</p>
       ${rows || `<p class="muted">Noch keine Hinweise. Du kannst sie in der Einzelprüfung unter „Hinweis für die KI“ geben – oder hier eine Regel anlegen.</p>`}
       <div class="row g8 wrapflex" style="border-top:1px solid var(--divider);padding-top:1rem">
-        <input class="text grow" style="flex:1 1 20rem" data-input="ruleText" placeholder="Neue Regel, z. B. „Rechnungen von Amazon gehören zu Einkäufe“" aria-label="Neue Regel" maxlength="500">
+        <input class="text grow" style="flex:1 1 20rem" data-input="ruleText" data-enter="ruleAdd" value="${esc(S.ruleText || "")}" placeholder="Neue Regel, z. B. „Rechnungen von Amazon gehören zu Einkäufe“" aria-label="Neue Regel" maxlength="500">
         <button type="button" class="btn" data-act="ruleAdd">${I.plus()} Regel hinzufügen</button></div>
       ${h.ignored ? `<div class="row between wrapflex g12" style="border-top:1px solid var(--divider);padding-top:1rem">
         <span>${plural(h.ignored, "Datei ist", "Dateien sind")} als „kein Dokument“ markiert und ${h.ignored === 1 ? "wird" : "werden"} nicht mehr vorgeschlagen.</span>
@@ -1601,7 +1634,15 @@ function loadHints() {
 }
 
 SCREENS.settings = () => {
-  if (!S.params.fresh) { refreshState().then(() => { if (S.route === "settings") go("settings", { fresh: true }); }); }
+  if (!S.params.fresh) {
+    // Werte im Hintergrund auffrischen und nur bei Änderungen sanft nachzeichnen (kein zweites Einblenden)
+    const before = JSON.stringify(S.state.settings);
+    refreshState().then(() => {
+      if (S.route !== "settings" || JSON.stringify(S.state.settings) === before) return;
+      S.params.fresh = true;
+      softRender();
+    });
+  }
   setTimeout(loadHints, 0);
   const s = S.state.settings;
   const seg = (key, opts) => `<div class="seg" role="group">${opts.map(([v, l]) => `<button type="button" aria-pressed="${s[key] === v}" data-act="seg" data-key="${key}" data-val="${v}">${l}</button>`).join("")}</div>`;
@@ -1853,7 +1894,7 @@ SCREENS.setup = () => {
 
   if (step === 2) {
     if (!st.hw) {
-      call("hardware").then(async (hw) => {
+      if (!st.hwLoading) call("hardware").then(async (hw) => {
         st.hw = hw;
         const fake = S.state.fake_ai;
         const model = S.state.model || {};
@@ -1867,8 +1908,10 @@ SCREENS.setup = () => {
           S.dl = { state: "done", percent: 100, installed: true };
           if (!model.model_id) await tryCall("start_download", chosen);
         }
+        st.hwLoading = false;
         render();
-      }).catch((e) => toast(e.message));
+      }).catch((e) => { st.hwLoading = false; toast(e.message); });
+      st.hwLoading = true;
       body = `<section class="card big"><div class="waiting"><div class="spinner"></div><p class="lead">Ich schaue mir deinen Computer an …</p></div></section>`;
     } else {
       const hw = st.hw;
@@ -1906,8 +1949,10 @@ SCREENS.setup = () => {
   }
 
   if (step === 3) {
-    if (!st.inbox) {
-      call("suggest_inbox").then((r) => { st.inbox = r; render(); }).catch((e) => toast(e.message));
+    if (!st.inbox && !st.inboxLoading) {
+      st.inboxLoading = true;
+      call("suggest_inbox").then((r) => { st.inbox = r; st.inboxLoading = false; render(); })
+        .catch((e) => { st.inboxLoading = false; toast(e.message); });
     }
     const inbox = st.inbox;
     const f = st.finder || {};
@@ -2037,6 +2082,11 @@ function loadLibInfo() {
 
 /* ---------- Neuordnung ---------- */
 function refreshReorg() {
+  clearTimeout(S.reorgRefreshTimer);
+  S.reorgRefreshTimer = setTimeout(refreshReorgNow, 200);  // viele Meldungen kurz hintereinander bündeln
+}
+
+function refreshReorgNow() {
   call("reorg_status").then((r) => { S.state.reorg = r; if (S.route === "reorg") softRender(); }).catch(() => {});
 }
 
@@ -2110,6 +2160,7 @@ function drawReorgPaused(r) {
     <main class="wrap narrow">
       <div class="stack g10"><h1 class="title">Die Neuordnung ist pausiert</h1>
       <p class="lead">Alles, was schon erledigt ist, bleibt gespeichert – auch nach einem Neustart oder Update. Es geht genau dort weiter, wo sie stand.</p></div>
+      ${r.error ? `<div class="notice warn">${I.warn()}<div><b>Ich habe angehalten, weil etwas nicht geklappt hat.</b>${esc(r.error)}</div></div>` : ""}
       <section class="card big stack g16">
         <span style="font-size:1.125rem;font-weight:600">Gerade dran: ${esc(label)}${r.total ? ` · ${r.done.toLocaleString("de-DE")} von ${r.total.toLocaleString("de-DE")}` : ""}</span>
         <div class="progress"><div style="width:${r.total ? Math.round((r.done / r.total) * 100) : 0}%"></div></div>
@@ -2148,12 +2199,12 @@ function drawReorgProgress(r) {
         ${r.detail && (r.phase === "reading" || r.phase === "backup") ? `<span class="small muted" style="overflow-wrap:anywhere">${esc(r.detail)}</span>` : ""}
         ${r.phase === "backup" ? `<span class="small muted">Dateien, die nur in der iCloud liegen, lade ich dabei herunter – das kann etwas dauern.</span>` : ""}
       </section>
-      <div class="row g12 wrapflex"><button type="button" class="btn" data-act="pause">Pause – später weitermachen</button>
+      <div class="row g12 wrapflex"><button type="button" class="btn" data-act="pause" ${S.reorgPausing ? "disabled" : ""}>${S.reorgPausing ? "Wird pausiert …" : "Pause – später weitermachen"}</button>
         <button type="button" class="btn link" data-act="cancel">Abbrechen</button></div>
     </main></div>`);
   S.actions = {
     back: () => go("home"),
-    pause: async (el) => { el.disabled = true; el.textContent = "Wird pausiert …"; await tryCall("reorg_pause"); },
+    pause: async () => { S.reorgPausing = true; softRender(); await tryCall("reorg_pause"); },
     cancel: async () => {
       const ok = await confirmDialog("Neuordnung abbrechen?", "Es wurde noch nichts verändert. Die Sicherung bleibt erhalten.", "Abbrechen", true);
       if (ok) { await tryCall("reorg_cancel"); await refreshState(); go("home"); }
@@ -2293,8 +2344,11 @@ function drawReorgHub(r) {
     batch: () => go("batch", { origin: "reorg" }),
     single: () => go("single", { origin: "reorg" }),
     finish: async (el) => {
+      if (S.reorgFinishing) return;
+      S.reorgFinishing = true;
       el.disabled = true;
       const res = await tryCall("reorg_finish");
+      S.reorgFinishing = false;
       if (res) { S.state.reorg = res; S.reorgJustDone = true; render(); } else el.disabled = false;
     },
     cancel: async () => {
