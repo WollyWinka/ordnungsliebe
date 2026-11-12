@@ -59,6 +59,7 @@ class Pipeline:
         self.reorg_folders: list[str] = []          # erlaubte Ordner während einer Neuordnung
         self.reorg_group: str = ""
         self.on_reorg_folder_added = None            # Rückruf: neuer Ordner während der Neuordnung
+        self.on_filed = None                         # Rückruf: Dokument wurde abgelegt (für die Suche)
         self._worker = threading.Thread(target=self._work, name="analyse", daemon=True)
         self._poller = threading.Thread(target=self._poll, name="scan-ordner", daemon=True)
         self._queue_file = paths.local_dir() / "warteschlange.json"
@@ -369,6 +370,10 @@ class Pipeline:
                 and item["suggestion"]["confidence"] >= self.settings.batch_threshold
                 and not item.get("batch_declined"))
 
+    def busy(self) -> bool:
+        with self._lock:
+            return any(i["status"] in ("waiting", "analyzing") for i in self.items.values())
+
     def overview(self, origin: str | None = None) -> dict:
         with self._lock:
             items = [i for i in self.items.values() if origin is None or i["origin"] == origin]
@@ -548,6 +553,12 @@ class Pipeline:
                 self.bus.emit("deadlines", {})
         except Exception:
             log.exception("Dokumentdaten konnten nicht gespeichert werden")
+            return
+        if self.on_filed:
+            try:
+                self.on_filed(Path(item["src"]), path, sha, item.get("text", ""), s)
+            except Exception:
+                log.exception("Suchindex konnte nicht aktualisiert werden")
 
     def recheck_similar(self, text: str, exclude: str = "", origin: str | None = None,
                         keep_if_folder: str = "", min_score: float = 0.3) -> int:

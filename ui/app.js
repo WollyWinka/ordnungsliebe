@@ -76,13 +76,13 @@ document.addEventListener("change", (ev) => {
 });
 document.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape" && $modal.innerHTML) { closeModal(null); return; }
-  if ($modal.innerHTML || ev.ctrlKey || ev.altKey || ev.metaKey || ev.repeat) return;
   const t = ev.target;
   if (ev.key === "Enter" && t && t.dataset && t.dataset.enter) {
-    const b = document.querySelector(`[data-act="${t.dataset.enter}"]`);
+    const b = (t.closest("#modal-root") || document).querySelector(`[data-act="${t.dataset.enter}"]`);
     if (b) { ev.preventDefault(); b.click(); }
     return;
   }
+  if ($modal.innerHTML || ev.ctrlKey || ev.altKey || ev.metaKey || ev.repeat) return;
   if (t && (t.closest("input, textarea, select, [contenteditable]") || (t.closest("button, a") && (ev.key === "Enter" || ev.key === " ")))) return;
   const map = SHORTCUTS[S.route];
   const name = map && (map[ev.key] || map[ev.key.toLowerCase()]);
@@ -341,6 +341,9 @@ function updateDialog() {
 /* ===================== Ereignisse vom Programm ===================== */
 
 const HANDLERS = {
+  search(st) {
+    if (S.route === "search" && S.search) { S.search.status = { ...(S.search.status || {}), ...st, indexed: st.done }; const el = document.getElementById("search-status"); if (el) el.textContent = searchStatusText(S.search.status); }
+  },
   deadlines() { if (S.route === "home") loadDeadlines(); },
   queue(payload) {
     if (!S.state) return;
@@ -460,7 +463,15 @@ SCREENS.home = () => {
       ${reorgBanner}
       ${hero}
       <div id="due-box">${dueBoxHTML()}</div>
-      <div class="tiles">
+      <form class="searchbar" role="search" onsubmit="return false">
+        <span class="searchbar-icon">${I.search(24)}</span>
+        <label class="sr-only" for="home-q">Dokument suchen</label>
+        <input id="home-q" class="text" type="search" data-enter="homeSearch" placeholder="Dokument suchen – z. B. „Kfz-Versicherung 2025“ oder „Erika Zahnarzt“" autocomplete="off">
+        <button type="button" class="btn violet" data-act="homeSearch">Suchen</button>
+      </form>
+      <div class="tiles four">
+        <button type="button" class="tile" data-act="collections"><div class="icon-box">${I.folder()}</div>
+          <span class="tile-title">Mappen</span><span class="tile-text">Dokumente für die Steuer oder einen Antrag zusammenstellen.</span></button>
         <button type="button" class="tile" data-act="reorg"><div class="icon-box">${I.layers()}</div>
           <span class="tile-title">Ablage neu ordnen</span><span class="tile-text">Bestehende Ordner aufräumen und übersichtlich sortieren.</span></button>
         <button type="button" class="tile" data-act="history"><div class="icon-box">${I.clock()}</div>
@@ -478,10 +489,253 @@ SCREENS.home = () => {
     update: () => updateDialog(),
     history: () => go("history"),
     settings: () => go("settings"),
+    collections: () => go("collections"),
+    homeSearch: () => go("search", { q: (document.getElementById("home-q").value || "").trim() }),
     ...dueActions(),
   };
   loadDeadlines();
 };
+
+/* ---------- Suche ---------- */
+function markSnippet(t) {
+  return esc(t).replace(/\u0002/g, "<mark>").replace(/\u0003/g, "</mark>");
+}
+
+function searchStatusText(st) {
+  if (!st) return "";
+  if (st.running && st.pending > 0) return `Ich lese gerade noch ${plural(st.pending, "Dokument", "Dokumente")} für die Suche – die Ergebnisse werden laufend vollständiger.`;
+  return st.indexed ? `Ich durchsuche ${plural(st.indexed, "Dokument", "Dokumente")} in deiner Ablage.` : "";
+}
+
+SCREENS.search = () => {
+  const q0 = S.params.q || "";
+  S.search = { q: q0, hits: null, sel: null, preview: null, status: null, seq: 0 };
+  setHTML(`<div class="screen">${topbar("Zur Startseite", "back", "Suchen")}
+    <main class="wrap wide" style="gap:1.25rem">
+      <form class="searchbar" role="search" onsubmit="return false">
+        <span class="searchbar-icon">${I.search(24)}</span>
+        <label class="sr-only" for="q">Suchbegriff</label>
+        <input id="q" class="text" type="search" data-input="q" value="${esc(q0)}" placeholder="Wonach suchst du? Wörter aus dem Dokument, Absender, Ordner …" autocomplete="off">
+      </form>
+      <p class="tiny muted" id="search-status"></p>
+      <div class="search-grid"><div id="hits" class="stack g10"></div><aside id="hit-preview" class="hit-preview" aria-label="Vorschau"></aside></div>
+    </main></div>`);
+  const f = document.getElementById("q");
+  f.focus(); f.setSelectionRange(f.value.length, f.value.length);
+  let timer = null;
+  S.actions = {
+    back: () => go("home"),
+    q: (el) => { clearTimeout(timer); timer = setTimeout(() => runSearch(el.value), 280); },
+    hit: (el) => selectHit(+el.dataset.i),
+    open: (el) => tryCall("open_file", el.dataset.path),
+    reveal: (el) => tryCall("show_in_folder", el.dataset.path),
+    toCollection: (el) => addToCollectionDialog(el.dataset.path),
+    prevPage: () => { const p = S.search.preview; if (p) loadHitPreview(Math.max(0, p.page - 1)); },
+    nextPage: () => { const p = S.search.preview; if (p) loadHitPreview(p.page + 1); },
+    zoom: () => {},
+  };
+  if (q0) runSearch(q0); else tryCall("search_status").then((st) => { const el = document.getElementById("search-status"); if (el && st) el.textContent = searchStatusText(st); });
+};
+
+async function runSearch(q) {
+  const sr = S.search;
+  if (!sr) return;
+  sr.q = q;
+  const seq = ++sr.seq;
+  if (!q.trim()) { sr.hits = null; drawHits(); return; }
+  const r = await tryCall("search", q);
+  if (!r || S.route !== "search" || seq !== sr.seq) return;
+  sr.hits = r.hits; sr.status = r.status; sr.sel = null; sr.preview = null;
+  drawHits();
+  if (r.hits.length && window.matchMedia("(min-width: 62rem)").matches) selectHit(0);
+}
+
+function drawHits() {
+  const sr = S.search;
+  const box = document.getElementById("hits");
+  if (!box) return;
+  const st = document.getElementById("search-status");
+  if (st) st.textContent = searchStatusText(sr.status);
+  if (sr.hits === null) { box.innerHTML = ""; document.getElementById("hit-preview").innerHTML = ""; return; }
+  if (!sr.hits.length) {
+    box.innerHTML = `<div class="card stack g8"><b style="font-size:1.1875rem">Nichts gefunden</b>
+      <span class="muted">Versuch es mit weniger oder anderen Wörtern – zum Beispiel nur dem Absender oder der Art des Dokuments.</span></div>`;
+    document.getElementById("hit-preview").innerHTML = "";
+    return;
+  }
+  box.innerHTML = `<span class="small muted">${sr.hits.length >= 60 ? "Die ersten 60 Treffer" : plural(sr.hits.length, "Treffer", "Treffer")}</span>
+    <ul class="hits">${sr.hits.map((h, i) => `<li><button type="button" class="hit ${sr.sel === i ? "on" : ""}" data-act="hit" data-i="${i}" aria-pressed="${sr.sel === i}">
+      <span class="hit-name">${esc(h.name)}</span>
+      <span class="small muted row g6">${I.folder(16)} ${esc(h.folder || "Ablage")}</span>
+      ${h.snippet ? `<span class="small hit-snip">${markSnippet(h.snippet)}</span>` : h.summary ? `<span class="small hit-snip">${esc(h.summary)}</span>` : ""}
+    </button></li>`).join("")}</ul>`;
+}
+
+function hitActions(h) {
+  return `<div class="row g10 wrapflex">
+    <button type="button" class="btn primary" data-act="open" data-path="${esc(h.path)}">Öffnen</button>
+    <button type="button" class="btn" data-act="reveal" data-path="${esc(h.path)}">Im Ordner zeigen</button>
+    <button type="button" class="btn violet" data-act="toCollection" data-path="${esc(h.path)}">${I.plus(18)} Zur Mappe</button></div>`;
+}
+
+function selectHit(i) {
+  const sr = S.search;
+  sr.sel = i;
+  drawHits();
+  const h = sr.hits[i];
+  const pane = document.getElementById("hit-preview");
+  pane.innerHTML = `<div class="stack g12"><div class="stack g4"><b style="font-size:1.1875rem;overflow-wrap:anywhere">${esc(h.name)}</b>
+    <span class="small muted">${esc(h.folder || "Ablage")}</span></div>${hitActions(h)}<div id="hit-paper">${previewHTML(null)}</div></div>`;
+  if (!window.matchMedia("(min-width: 62rem)").matches) pane.scrollIntoView({ behavior: "smooth", block: "start" });
+  loadHitPreview(0);
+}
+
+async function loadHitPreview(page) {
+  const sr = S.search;
+  const h = sr.hits && sr.hits[sr.sel];
+  if (!h) return;
+  const pv = await tryCall("preview_path", h.path, page);
+  if (!pv || S.route !== "search" || sr.hits[sr.sel] !== h) return;
+  sr.preview = pv;
+  const box = document.getElementById("hit-paper");
+  if (box) box.innerHTML = previewHTML(pv, false) + pagerHTML(pv).replace(/<button type="button" class="btn small" data-act="zoom">Vergrößern<\/button>/, "");
+}
+
+/* ---------- Mappen ---------- */
+async function addToCollectionDialog(path) {
+  const list = (await tryCall("collections_list")) || [];
+  const own = list.filter((c) => !c.auto);
+  const tax = list.filter((c) => c.auto);
+  openModal(`<h2>In welche Mappe?</h2>
+    <p class="small muted">Das Dokument bleibt in seinem Ordner. In der Mappe steht nur ein Verweis darauf.</p>
+    <div class="stack g8">${[...tax, ...own].map((c) => `<button type="button" class="choice" data-act="pick" data-id="${esc(c.id)}">
+      <div class="icon-box s">${I.folder(22)}</div><div class="stack g4 grow"><span style="font-size:1.125rem;font-weight:600">${esc(c.name)}</span>
+      <span class="tiny muted">${plural(c.count, "Dokument", "Dokumente")}${c.auto ? " · stellt sich von selbst zusammen" : ""}</span></div></button>`).join("")}</div>
+    <div class="stack g8"><label class="tiny muted" for="new-col">Oder eine neue Mappe anlegen</label>
+    <div class="row g8"><input class="text" id="new-col" data-enter="create" placeholder="z. B. Antrag Elterngeld" maxlength="60">
+      <button type="button" class="btn violet" data-act="create">Anlegen</button></div></div>
+    <div class="btns"><button type="button" class="btn" data-act="cancel">Abbrechen</button></div>`, {
+    cancel: () => closeModal(null),
+    pick: async (el) => {
+      const r = await tryCall("collection_add", el.dataset.id, path);
+      if (r !== undefined) { closeModal(null); toast(r === false ? "Das Dokument ist schon in dieser Mappe." : "Zur Mappe hinzugefügt."); }
+    },
+    create: async () => {
+      const name = (document.getElementById("new-col").value || "").trim();
+      if (!name) { toast("Bitte gib der Mappe einen Namen."); return; }
+      const c = await tryCall("collection_create", name, path);
+      if (c) { closeModal(null); toast(`Mappe „${c.name}“ angelegt.`); }
+    },
+  });
+}
+
+SCREENS.collections = () => {
+  setHTML(`<div class="screen">${topbar("Zur Startseite", "back", "Mappen")}
+    <main class="wrap narrow"><div class="waiting"><div class="spinner"></div></div></main></div>`);
+  S.actions = { back: () => go("home") };
+  call("collections_list").then((list) => { if (S.route === "collections") drawCollections(list); }).catch((e) => toast(e.message));
+};
+
+function drawCollections(list) {
+  const card = (c) => `<li><button type="button" class="choice" data-act="openCol" data-id="${esc(c.id)}">
+    <div class="icon-box">${I.folder(26)}</div>
+    <div class="stack g4 grow"><span style="font-size:1.25rem;font-weight:700">${esc(c.name)}</span>
+    <span class="small muted">${plural(c.count, "Dokument", "Dokumente")}${c.auto ? " · stellt sich von selbst zusammen" : ""}</span></div>${I.right()}</button></li>`;
+  const tax = list.filter((c) => c.auto);
+  const own = list.filter((c) => !c.auto);
+  setHTML(`<div class="screen">${topbar("Zur Startseite", "back", "Mappen")}
+    <main class="wrap narrow">
+      <div class="stack g10"><h1 class="title">Mappen</h1>
+      <p class="lead">Eine Mappe sammelt Dokumente für einen Zweck – zum Beispiel die Steuererklärung. Die Dokumente bleiben dabei in ihren Ordnern; die Mappe merkt sich nur, wo sie liegen.</p></div>
+      <section class="stack g10"><h2 class="h2">Für die Steuer</h2>
+        ${tax.length ? `<ul class="plainlist">${tax.map(card).join("")}</ul>` : `<div class="card"><span class="muted">Sobald ich beim Einsortieren Dokumente erkenne, die für die Steuer wichtig sind (Lohnsteuerbescheinigung, Spendenquittung, Handwerkerrechnung …), sammle ich sie hier nach Jahren.</span></div>`}
+      </section>
+      <section class="stack g10"><h2 class="h2">Eigene Mappen</h2>
+        ${own.length ? `<ul class="plainlist">${own.map(card).join("")}</ul>` : `<div class="card"><span class="muted">Noch keine. Lege eine an und füge über die Suche Dokumente hinzu.</span></div>`}
+        <div class="row g8" style="max-width:36rem"><input class="text" id="new-col" data-enter="create" placeholder="Neue Mappe, z. B. Antrag Elterngeld" maxlength="60" aria-label="Name der neuen Mappe">
+          <button type="button" class="btn violet" data-act="create">${I.plus(18)} Anlegen</button></div>
+      </section>
+    </main></div>`);
+  S.actions = {
+    back: () => go("home"),
+    openCol: (el) => go("collection", { id: el.dataset.id }),
+    create: async () => {
+      const name = (document.getElementById("new-col").value || "").trim();
+      if (!name) { toast("Bitte gib der Mappe einen Namen."); return; }
+      const c = await tryCall("collection_create", name, "");
+      if (c) go("collection", { id: c.id });
+    },
+  };
+}
+
+SCREENS.collection = () => {
+  setHTML(`<div class="screen">${topbar("Zu den Mappen", "back", "Mappe")}
+    <main class="wrap narrow"><div class="waiting"><div class="spinner"></div></div></main></div>`);
+  S.actions = { back: () => go("collections") };
+  call("collection_view", S.params.id).then((c) => { if (S.route === "collection") drawCollection(c); }).catch((e) => { toast(e.message); go("collections"); });
+};
+
+function drawCollection(c) {
+  const missing = c.items.filter((i) => !i.exists).length;
+  const rows = c.items.map((i) => `<li class="${i.exists ? "" : "off"}">
+    <div class="mini" aria-hidden="true"><span></span><span></span><span></span><span style="width:75%"></span></div>
+    <div class="stack g4 grow" style="flex-basis:16rem;min-width:0">
+      <button type="button" class="textbtn" style="align-self:flex-start;text-align:left;font-size:1.125rem;font-weight:600;color:var(--text);overflow-wrap:anywhere" data-act="open" data-path="${esc(i.path)}" ${i.exists ? "" : "disabled"}>${esc(i.name)}</button>
+      <span class="small muted">${i.exists ? `${I.folder(16)} ${esc(i.folder || "Ablage")}` : "Nicht mehr gefunden – vielleicht gelöscht oder umbenannt."}</span></div>
+    <div class="row g8">${i.exists ? `<button type="button" class="btn small" data-act="reveal" data-path="${esc(i.path)}">Im Ordner zeigen</button>` : ""}
+      <button type="button" class="iconbtn" data-act="remove" data-path="${esc(i.orig || i.path)}" data-cur="${esc(i.path)}" aria-label="Aus der Mappe nehmen" title="Aus der Mappe nehmen">${I.x()}</button></div>
+  </li>`).join("");
+  setHTML(`<div class="screen">${topbar("Zu den Mappen", "back", c.auto ? "Stellt sich von selbst zusammen" : "Eigene Mappe")}
+    <main class="wrap narrow">
+      <div class="row between wrapflex g12"><h1 class="title">${esc(c.name)}</h1>
+        ${c.auto ? "" : `<div class="row g8"><button type="button" class="btn small" data-act="rename">Umbenennen</button>
+          <button type="button" class="btn small danger" data-act="del">Mappe löschen</button></div>`}</div>
+      <p class="lead">${c.items.length ? plural(c.items.length, "Dokument", "Dokumente") + ". " : ""}Die Dokumente bleiben in ihren Ordnern. „Aus der Mappe nehmen“ löscht nichts.</p>
+      ${c.items.length ? `<ul class="biglist col-list">${rows}</ul>` : `<div class="card stack g12"><span class="muted">Diese Mappe ist noch leer. Suche ein Dokument und tippe auf „Zur Mappe“.</span>
+        <button type="button" class="btn violet" style="align-self:flex-start" data-act="search">${I.search(20)} Dokument suchen</button></div>`}
+      ${c.items.length ? `<div class="footbar"><span class="muted" style="flex:1 1 17rem">Alles in einer Datei – zum Ausdrucken, Mailen oder Hochladen. ${missing ? `(${missing} nicht gefundene Dokumente lasse ich aus.)` : ""}</span>
+        <div class="row g10 wrapflex"><button type="button" class="btn tall" data-act="exportZip">Als ZIP-Ordner</button>
+        <button type="button" class="btn primary tall" data-act="exportPdf">${I.doc(22)} Als ein PDF speichern</button></div></div>` : ""}
+    </main></div>`);
+  const reload = async () => { const c2 = await tryCall("collection_view", c.id); if (c2 && S.route === "collection") drawCollection(c2); };
+  const doExport = async (el, fmt) => {
+    const old = el.innerHTML;
+    el.disabled = true; el.innerHTML = `<div class="spinner small"></div> Wird erstellt …`;
+    const r = await tryCall("collection_export", c.id, fmt);
+    el.disabled = false; el.innerHTML = old;
+    if (!r) return;
+    openModal(`<div class="big-icon" style="margin:0 auto">${I.check(36, 2.4)}</div><h2 style="text-align:center">Fertig!</h2>
+      <p style="text-align:center">„${esc(r.name)}“ liegt jetzt in <b>${esc(r.folder)}</b>.</p>
+      <div class="btns"><button type="button" class="btn" data-act="close">Schließen</button>
+      <button type="button" class="btn" data-act="reveal">Im Ordner zeigen</button>
+      <button type="button" class="btn primary" data-act="open">Öffnen</button></div>`, {
+      close: () => closeModal(null),
+      reveal: () => { tryCall("show_in_folder", r.path); closeModal(null); },
+      open: () => { tryCall("open_file", r.path); closeModal(null); },
+    });
+  };
+  S.actions = {
+    back: () => go("collections"),
+    open: (el) => tryCall("open_file", el.dataset.path),
+    reveal: (el) => tryCall("show_in_folder", el.dataset.path),
+    search: () => go("search", {}),
+    remove: async (el) => { if (await tryCall("collection_remove", c.id, c.auto ? el.dataset.cur : el.dataset.path)) { toast("Aus der Mappe genommen. Das Dokument liegt weiter in seinem Ordner."); reload(); } },
+    exportPdf: (el) => doExport(el, "pdf"),
+    exportZip: (el) => doExport(el, "zip"),
+    rename: async () => {
+      openModal(`<h2>Mappe umbenennen</h2><input class="text" id="col-name" data-enter="ok" value="${esc(c.name)}" maxlength="60" aria-label="Name">
+        <div class="btns"><button type="button" class="btn" data-act="cancel">Abbrechen</button><button type="button" class="btn primary" data-act="ok">Speichern</button></div>`, {
+        cancel: () => closeModal(null),
+        ok: async () => { const v = document.getElementById("col-name").value.trim(); if (v && await tryCall("collection_rename", c.id, v)) { closeModal(null); reload(); } },
+      });
+      const f = document.getElementById("col-name"); if (f) { f.focus(); f.select(); }
+    },
+    del: async () => {
+      const ok = await confirmDialog("Mappe löschen?", "Nur die Mappe verschwindet. Alle Dokumente bleiben in ihren Ordnern.", "Mappe löschen", true);
+      if (ok && await tryCall("collection_delete", c.id)) { toast("Mappe gelöscht."); go("collections"); }
+    },
+  };
+}
 
 /* ---------- Fristen („Demnächst fällig“) ---------- */
 const MONTHS_SHORT = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"];

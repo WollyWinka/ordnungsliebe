@@ -616,3 +616,59 @@ def test_person_in_filename_and_subfolder(env):
     mems = [e for e in api.memory.entries if e["filename"].startswith("2026-12")]
     assert mems and mems[0]["folder"] == "Finanzen/Bank" and not mems[0]["corrected"]
     api.shutdown()
+
+
+def test_search_index_and_collections(env, monkeypatch):
+    import pymupdf as _pm
+    monkeypatch.setenv("ORDNUNGSLIEBE_EXPORT", str(env["tmp"] / "export"))
+    (env["tmp"] / "export").mkdir()
+    api = make_api(env)
+    # Bestand wird indiziert (auch ungelesene Dokumente)
+    assert wait_for(lambda: api.search_index.count() >= 1 and not api.search_index.status["running"], timeout=30)
+    hits = api.search("sparkas kontoauszug")["data"]["hits"]
+    assert [h["name"] for h in hits] == ["2026-09 Kontoauszug.pdf"]
+    assert "\u0002" in hits[0]["snippet"]
+    assert api.search("")["data"]["hits"] == []
+    assert api.search('" OR *')["ok"]  # Sonderzeichen brechen nichts
+
+    # Neu abgelegtes Dokument ist sofort auffindbar, inkl. Steuer-Kennzeichen → Steuer-Mappe
+    text_pdf(env["inbox"] / "spende.pdf", ["Tierheim Bamberg e.V.", "Zuwendungsbestätigung (Spende) vom 03.03.2026",
+                                           "Betrag 50 Euro"])
+    item = _one_item(api)
+    assert item["suggestion"]["steuer"] is True
+    dst = api.confirm(item["id"])["data"]["dst"]
+    hits = api.search("Tierheim")["data"]["hits"]
+    assert hits and hits[0]["path"] == dst
+    cols = api.collections_list()["data"]
+    assert {"id": "steuer-2026", "name": "Steuer 2026", "auto": True, "count": 1} in cols
+
+    # Eigene Mappe: nur Verweise, Dokumente bleiben liegen
+    konto = env["lib"] / "Finanzen" / "Bank" / "2026-09 Kontoauszug.pdf"
+    c = api.collection_create("Antrag Wohngeld", str(konto))["data"]
+    assert api.collection_add(c["id"], dst)["data"] is True
+    assert api.collection_add(c["id"], dst)["data"] is False  # doppelt
+    view = api.collection_view(c["id"])["data"]
+    assert [i["exists"] for i in view["items"]] == [True, True]
+
+    pdf = Path(api.collection_export(c["id"], "pdf")["data"]["path"])
+    doc = _pm.open(str(pdf))
+    assert doc.page_count == 3 and len(doc.get_toc()) == 3 and "Antrag Wohngeld" in doc[0].get_text()
+    doc.close()
+    z = Path(api.collection_export(c["id"], "zip")["data"]["path"])
+    import zipfile
+    assert len(zipfile.ZipFile(z).namelist()) == 2
+    assert konto.exists() and Path(dst).exists()  # Originale unberührt
+
+    # Datei wird verschoben → Mappe findet sie über die Prüfsumme wieder
+    moved = env["lib"] / "Finanzen" / "Kontoauszug-verschoben.pdf"
+    shutil.move(str(konto), moved)
+    api._index_search()
+    view = api.collection_view(c["id"])["data"]
+    assert str(moved) in [i["path"] for i in view["items"]]
+
+    assert api.collection_remove("steuer-2026", dst)["ok"]
+    assert not any(x["id"] == "steuer-2026" for x in api.collections_list()["data"])
+    assert api.collection_delete(c["id"])["ok"] and Path(dst).exists()
+    # Öffnen nur für Dateien der Ablage
+    assert not api.open_file("/etc/passwd")["ok"]
+    api.shutdown()

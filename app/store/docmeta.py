@@ -61,6 +61,15 @@ class DocMeta:
                     self._save()
                     return
 
+    def set_flag(self, sha: str, **flags) -> bool:
+        with self._lock:
+            rec = self.docs.get(sha)
+            if not rec:
+                return False
+            rec.update(flags)
+            self._save()
+            return True
+
     def all(self) -> dict[str, dict]:
         with self._lock:
             return {k: dict(v) for k, v in self.docs.items()}

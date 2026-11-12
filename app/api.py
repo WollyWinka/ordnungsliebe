@@ -99,12 +99,20 @@ class Api:
         from .store.hints import Hints, Ignored
         self.hints = Hints()
         self.ignored = Ignored()
+        from .store.collections import Collections
         from .store.docmeta import DocMeta
+        from .store.search import SearchIndex
         self.docmeta = DocMeta()
+        self.search_index = SearchIndex()
+        self.collections = Collections()
+        self._search_lock = threading.Lock()
+        self._search_again = False
+        self._stopping = threading.Event()
         self.pipeline = Pipeline(self.settings_store, self.ai, self.memory, self.history, self.dup,
                                  self.schemes, bus, hints=self.hints, ignored=self.ignored, docmeta=self.docmeta)
         self.reorganizer = reorg.Reorganizer(self.settings_store, self.ai, self.pipeline, self.history,
                                              self.schemes, self.dup, self.backups, bus)
+        self.pipeline.on_filed = self._on_filed
         self.models = setup.ModelManager(self.settings_store, bus)
         from .core.updater import Updater
         self.updater = Updater(self.settings_store, bus)
@@ -139,7 +147,95 @@ class Api:
         self.index_library_async()
 
     def index_library_async(self) -> None:
-        threading.Thread(target=self._index_library, name="ablage-index", daemon=True).start()
+        def run():
+            self._index_library()
+            self._index_search()
+        threading.Thread(target=run, name="ablage-index", daemon=True).start()
+
+    # --- Suchindex ----------------------------------------------------------------------
+    def _meta_extra(self, sha: str) -> str:
+        rec = self.docmeta.get(sha) if sha else None
+        if not rec:
+            return ""
+        parts = [rec.get("summary", ""), rec.get("person", "")]
+        parts += [d.get("what", "") for d in rec.get("deadlines", [])]
+        if rec.get("steuer"):
+            parts.append("Steuer")
+        return " ".join(p for p in parts if p)
+
+    def _on_filed(self, src: Path, dst: Path, sha: str, text: str, suggestion: dict) -> None:
+        lib = self.settings_store.get().library_dir
+        if not lib:
+            return
+        if str(src) != str(dst):
+            self.search_index.remove(str(src))
+        self.search_index.put(dst, root=Path(lib), sha=sha, text=text, extra=self._meta_extra(sha))
+
+    def _index_search(self) -> None:
+        """Baut den Suchindex auf: erst alles aus dem Zwischenspeicher, dann ungelesene Dokumente langsam."""
+        from .docs import reader
+        if not self._search_lock.acquire(blocking=False):
+            self._search_again = True
+            return
+        try:
+            while True:
+                self._search_again = False
+                lib = self.settings_store.get().library_dir
+                if not lib or not Path(lib).is_dir():
+                    return
+                root = Path(lib)
+                st = self.search_index.status
+                st.update(running=True, done=0, total=0, pending=0)
+                files = list(library.walk_documents(root, include_cloud_only=False, skip_photos=True))
+                current = {str(p) for p in files}
+                for old in self.search_index.paths():
+                    if old not in current:
+                        self.search_index.remove(old)
+                todo = [p for p in files if not self.search_index.is_current(p)]
+                st.update(total=len(files), done=len(files) - len(todo), pending=len(todo))
+                later = []
+                for p in todo:
+                    if self._stopping.is_set():
+                        return
+                    try:
+                        sha = self.dup.known_sha(p) or reader.file_hash(p)
+                    except OSError:
+                        continue
+                    text = reader.cached_text(sha)
+                    if text is None:
+                        later.append((p, sha))
+                        continue
+                    self.search_index.put(p, root=root, sha=sha, text=text, extra=self._meta_extra(sha))
+                    st["done"] += 1
+                st["pending"] = len(later)
+                bus.emit("search", dict(st))
+                for p, sha in later:  # ungelesene Dokumente: nur, wenn sonst nichts zu tun ist
+                    while (self.pipeline.busy() or self.reorganizer.state.get("phase") in reorg.RUNNING) \
+                            and not self._stopping.is_set():
+                        time.sleep(2)
+                    if self._stopping.is_set() or self._search_again:
+                        break
+                    try:
+                        if not p.exists():
+                            continue
+                        text = reader.read_document(p, sha=sha).text
+                    except Exception:
+                        log.info("Für die Suche nicht lesbar: %s", p)
+                        text = ""
+                    self.search_index.put(p, root=root, sha=sha, text=text, extra=self._meta_extra(sha))
+                    st["done"] += 1
+                    st["pending"] -= 1
+                    if st["pending"] % 10 == 0:
+                        bus.emit("search", dict(st))
+                    time.sleep(0.05)
+                if not self._search_again:
+                    break
+        except Exception:
+            log.exception("Suchindex konnte nicht aufgebaut werden")
+        finally:
+            self.search_index.status["running"] = False
+            bus.emit("search", dict(self.search_index.status))
+            self._search_lock.release()
 
     def _index_library(self) -> None:
         """Prüfsummen der Ablage für die Doppelten-Erkennung (Cloud-Platzhalter werden übersprungen)."""
@@ -170,6 +266,7 @@ class Api:
             log.warning("KI-Start fehlgeschlagen: %s", exc)
 
     def shutdown(self) -> None:
+        self._stopping.set()
         self.pipeline.stop()
         self.scanfinder.stop()
         self.ai.shutdown()
@@ -426,6 +523,141 @@ class Api:
         return {"folder": folder, "folder_display": naming.display_folder(folder), "filename": filename,
                 "person": person}
 
+    # --- Suche ------------------------------------------------------------------------
+    def _lib(self) -> Path:
+        return Path(self.settings_store.get().library_dir or ".")
+
+    @api_method
+    def search(self, text: str):
+        hits = self.search_index.search(text or "")
+        for h in hits:
+            sha = self.search_index.sha_for_path(h["path"])
+            rec = self.docmeta.get(sha) if sha else None
+            h["summary"] = rec.get("summary", "") if rec else ""
+        st = dict(self.search_index.status)
+        st["indexed"] = self.search_index.count()
+        return {"hits": hits, "status": st}
+
+    @api_method
+    def search_status(self):
+        st = dict(self.search_index.status)
+        st["indexed"] = self.search_index.count()
+        return st
+
+    # --- Mappen ------------------------------------------------------------------------
+    def _resolve(self, doc: dict) -> dict:
+        path = doc.get("path", "")
+        if not Path(path).exists() and doc.get("sha"):
+            path = self.search_index.path_for_sha(doc["sha"]) or (self.docmeta.get(doc["sha"]) or {}).get("path", path)
+        p = Path(path)
+        sha = doc.get("sha") or self.search_index.sha_for_path(path) or ""
+        rec = self.docmeta.get(sha) if sha else None
+        try:
+            folder = " › ".join(p.parent.relative_to(self._lib()).parts)
+        except ValueError:
+            folder = str(p.parent)
+        return {"path": str(p), "orig": doc.get("path", ""), "name": p.name, "folder": folder, "exists": p.exists(),
+                "sha": sha, "summary": (rec or {}).get("summary", ""), "doc_date": (rec or {}).get("doc_date", "")}
+
+    def _tax_collections(self) -> dict[str, list[dict]]:
+        years: dict[str, list[dict]] = {}
+        for sha, rec in self.docmeta.all().items():
+            if not rec.get("steuer"):
+                continue
+            year = (rec.get("doc_date") or "")[:4]
+            if not year.isdigit():
+                year = time.strftime("%Y", time.localtime(rec.get("ts", time.time())))
+            years.setdefault(year, []).append({"path": rec["path"], "sha": sha})
+        return years
+
+    @api_method
+    def collections_list(self):
+        out = []
+        for year, docs in sorted(self._tax_collections().items(), reverse=True):
+            n = sum(1 for d in docs if Path(d["path"]).exists() or self.search_index.path_for_sha(d["sha"]))
+            if n:
+                out.append({"id": f"steuer-{year}", "name": f"Steuer {year}", "auto": True, "count": n})
+        for c in self.collections.list():
+            out.append({"id": c["id"], "name": c["name"], "auto": False, "count": len(c["docs"])})
+        return out
+
+    def _collection_docs(self, cid: str) -> tuple[str, bool, list[dict]]:
+        if cid.startswith("steuer-"):
+            year = cid.split("-", 1)[1]
+            docs = self._tax_collections().get(year, [])
+            return f"Steuer {year}", True, docs
+        c = self.collections.get(cid)
+        return c["name"], False, c["docs"]
+
+    @api_method
+    def collection_view(self, cid: str):
+        name, auto, docs = self._collection_docs(cid)
+        items = [self._resolve(d) for d in docs]
+        if auto:
+            items = [i for i in items if i["exists"]]
+            items.sort(key=lambda i: (i["doc_date"], i["name"]))
+        else:  # verschobene Dokumente merken sich den neuen Ort
+            for i in items:
+                if i["exists"] and i["orig"] != i["path"]:
+                    self.collections.update_path(cid, i["orig"], i["path"])
+        return {"id": cid, "name": name, "auto": auto, "items": items}
+
+    @api_method
+    def collection_create(self, name: str, path: str = ""):
+        c = self.collections.create(name)
+        if path:
+            self.collections.add(c["id"], path, self.search_index.sha_for_path(path) or "")
+        return c
+
+    @api_method
+    def collection_rename(self, cid: str, name: str):
+        self.collections.rename(cid, name)
+        return True
+
+    @api_method
+    def collection_delete(self, cid: str):
+        """Löscht nur die Mappe (die Liste), nie die Dokumente."""
+        self.collections.delete(cid)
+        return True
+
+    @api_method
+    def collection_add(self, cid: str, path: str):
+        if cid.startswith("steuer-"):
+            sha = self.search_index.sha_for_path(path)
+            if not sha or not self.docmeta.get(sha):
+                raise ValueError("Dieses Dokument kenne ich noch nicht genauer – lege es in eine eigene Mappe.")
+            self.docmeta.set_flag(sha, steuer=True)
+            return True
+        if not Path(path).exists():
+            raise FileNotFoundError("Die Datei ist nicht mehr da.")
+        return self.collections.add(cid, path, self.search_index.sha_for_path(path) or "")
+
+    @api_method
+    def collection_remove(self, cid: str, path: str):
+        """Nimmt ein Dokument aus der Mappe – die Datei selbst bleibt, wo sie ist."""
+        if cid.startswith("steuer-"):
+            sha = self.search_index.sha_for_path(path)
+            found = self.docmeta.find_path(path)
+            sha = sha if sha and self.docmeta.get(sha) else (found[0] if found else "")
+            if not sha:
+                raise KeyError("Dokument nicht gefunden.")
+            self.docmeta.set_flag(sha, steuer=False)
+            return True
+        self.collections.remove(cid, path)
+        return True
+
+    @api_method
+    def collection_export(self, cid: str, fmt: str = "pdf"):
+        from .core import export
+        name, _auto, _docs = self._collection_docs(cid)
+        items = [i for i in self.collection_view.__wrapped__(self, cid)["items"] if i["exists"]]
+        if not items:
+            raise ValueError("In dieser Mappe ist noch kein Dokument.")
+        docs = [{"path": i["path"], "title": i["summary"] or Path(i["name"]).stem} for i in items]
+        target_dir = Path(os.environ["ORDNUNGSLIEBE_EXPORT"]) if os.environ.get("ORDNUNGSLIEBE_EXPORT") else None
+        path = export.export_zip(name, docs, target_dir) if fmt == "zip" else export.export_pdf(name, docs, target_dir)
+        return {"path": str(path), "name": path.name, "folder": setup.pretty_path(str(path.parent))}
+
     # --- Fristen ----------------------------------------------------------------------
     @api_method
     def deadlines(self, include_done: bool = False):
@@ -458,17 +690,29 @@ class Api:
         else:
             subprocess.Popen(["xdg-open", str(p)])
 
-    @api_method
-    def open_file(self, path: str):
+    def _safe_doc(self, path: str) -> Path:
+        """Nur Dokumente aus der Ablage oder exportierte Mappen öffnen – nie Programme."""
+        from .core import export
+        from .docs import reader
         p = Path(path)
         if not p.is_file():
             raise FileNotFoundError("Die Datei ist nicht mehr da – vielleicht wurde sie verschoben.")
-        self._open(p)
+        rp = p.resolve()
+        roots = [self._lib().resolve(), export.export_dir().resolve(), (paths.cache_dir() / "kalender").resolve()]
+        if not any(r in rp.parents for r in roots):
+            raise ValueError("Diese Datei liegt nicht in deiner Ablage.")
+        if reader.file_kind(p) is None and p.suffix.lower() not in (".zip", ".ics"):
+            raise ValueError("Diese Datei kann ich nicht öffnen.")
+        return p
+
+    @api_method
+    def open_file(self, path: str):
+        self._open(self._safe_doc(path))
         return True
 
     @api_method
     def show_in_folder(self, path: str):
-        p = Path(path)
+        p = self._safe_doc(path)
         if not p.exists():
             raise FileNotFoundError("Die Datei ist nicht mehr da – vielleicht wurde sie verschoben.")
         if os.environ.get("ORDNUNGSLIEBE_NO_OPEN"):
@@ -627,7 +871,9 @@ class Api:
 
     @api_method
     def reorg_finish(self):
-        return self.reorganizer.finish()
+        r = self.reorganizer.finish()
+        self.index_library_async()
+        return r
 
     @api_method
     def reorg_pause(self):
