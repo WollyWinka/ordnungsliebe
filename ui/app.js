@@ -75,8 +75,24 @@ document.addEventListener("change", (ev) => {
   if (fn) fn(el, ev);
 });
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape" && $modal.innerHTML) closeModal(null);
+  if (ev.key === "Escape" && $modal.innerHTML) { closeModal(null); return; }
+  if ($modal.innerHTML || ev.ctrlKey || ev.altKey || ev.metaKey || ev.repeat) return;
+  const t = ev.target;
+  if (t && (t.closest("input, textarea, select, [contenteditable]") || (t.closest("button, a") && (ev.key === "Enter" || ev.key === " ")))) return;
+  const map = SHORTCUTS[S.route];
+  const name = map && (map[ev.key] || map[ev.key.toLowerCase()]);
+  if (!name) return;
+  const btn = document.querySelector(`[data-act="${name}"]:not([disabled])`);
+  if (!btn) return;
+  ev.preventDefault();
+  btn.click();
 });
+
+// Tastaturkürzel: Taste → Knopf (data-act), der dann ganz normal angeklickt wird.
+const SHORTCUTS = {
+  single: { Enter: "confirm", Delete: "reject", " ": "skip", h: "hintToggle" },
+  batch: { Enter: "go" },
+};
 
 function go(route, params) {
   S.route = route;
@@ -482,34 +498,68 @@ SCREENS.batch = () => {
   }).catch((e) => toast(e.message));
 };
 
+function batchGroups(items) {
+  const map = new Map();
+  for (const it of items) {
+    const key = it.suggestion.folder;
+    if (!map.has(key)) map.set(key, { key, label: it.suggestion.folder_display, isNew: !!it.suggestion.is_new_folder, items: [] });
+    map.get(key).items.push(it);
+  }
+  return [...map.values()].sort((a, b) => b.items.length - a.items.length || a.label.localeCompare(b.label, "de"));
+}
+
 function drawBatch() {
   const { items, off, origin } = S.batch;
+  if (!S.batch.open) S.batch.open = new Set(items.length <= 24 ? items.map((i) => i.suggestion.folder) : []);
+  const open = S.batch.open;
   const [backLabel, backFn] = backTo(origin);
   const ov = (S.state.queue.by_origin && S.state.queue.by_origin[origin]) || {};
   const checked = items.length - off.size;
   const rest = Math.max(0, (ov.total || items.length) - checked);
-  const rows = items.map((it) => {
-    const s = it.suggestion;
-    const isOff = off.has(it.id);
-    return `<li class="${isOff ? "off" : ""}"><label>
-      <input type="checkbox" ${isOff ? "" : "checked"} data-change="toggle" data-id="${esc(it.id)}">
-      <div class="mini" aria-hidden="true"><span></span><span></span><span></span><span style="width:75%"></span></div>
-      <div class="stack g4 grow" style="flex-basis:16rem"><span style="font-size:1.1875rem;font-weight:600;overflow-wrap:anywhere">${esc(s.filename)}</span>
-      <span class="small muted">${esc(s.summary || it.name)}</span></div>
-      <div class="foldertag">${I.folder(18)} ${esc(s.folder_display)}</div></label></li>`;
+  const groups = batchGroups(items);
+  const html = groups.map((g, gi) => {
+    const on = g.items.filter((i) => !off.has(i.id)).length;
+    const isOpen = open.has(g.key);
+    const rows = isOpen ? g.items.map((it) => {
+      const s = it.suggestion;
+      const isOff = off.has(it.id);
+      return `<li class="${isOff ? "off" : ""}"><label>
+        <input type="checkbox" ${isOff ? "" : "checked"} data-change="toggle" data-id="${esc(it.id)}">
+        <div class="mini" aria-hidden="true"><span></span><span></span><span></span><span style="width:75%"></span></div>
+        <div class="stack g4 grow" style="flex-basis:16rem"><span style="font-size:1.1875rem;font-weight:600;overflow-wrap:anywhere">${esc(s.filename)}</span>
+        <span class="small muted">${esc(s.summary || it.name)}</span></div></label></li>`;
+    }).join("") : "";
+    return `<section class="bgroup ${on ? "" : "off"}">
+      <div class="bgroup-head">
+        <label class="bgroup-check"><input type="checkbox" data-change="toggleGroup" data-g="${gi}" ${on ? "checked" : ""} ${on && on < g.items.length ? 'data-mixed="1"' : ""}
+          aria-label="Alle ${g.items.length} für ${esc(g.label)}">
+          <span class="foldertag">${I.folder(18)} ${esc(g.label)}</span>${g.isNew ? '<span class="tag new">Neuer Ordner</span>' : ""}</label>
+        <button type="button" class="btn link small" data-act="openGroup" data-g="${gi}" aria-expanded="${isOpen}">
+          ${on === g.items.length ? plural(g.items.length, "Dokument", "Dokumente") : `${on} von ${g.items.length}`} ${I.chev()}</button>
+      </div>
+      ${isOpen ? `<ul class="biglist">${rows}</ul>` : ""}
+    </section>`;
   }).join("");
   setHTML(`<div class="screen">${topbar(backLabel, "back", "Schritt 1 von 2 · Sichere Vorschläge")}
     <main class="wrap narrow">
       <div class="stack g10"><h1 class="title">${items.length === 1 ? "Bei diesem Dokument bin ich mir sicher" : `Bei diesen ${items.length} Dokumenten bin ich mir sicher`}</h1>
-      <p class="lead">Schau kurz drüber. Passt etwas nicht, nimm einfach den Haken weg – dann zeige ich dir das Dokument gleich einzeln.</p></div>
-      <ul class="biglist">${rows}</ul>
+      <p class="lead">Sortiert nach Ordner. Ein Haken beim Ordner gilt für alle Dokumente darin. Passt etwas nicht, nimm den Haken weg – dann zeige ich dir das Dokument gleich einzeln.</p></div>
+      <div class="stack g12">${html}</div>
       <div class="footbar"><span class="muted" style="flex:1 1 17rem">${rest ? `Danach: ${plural(rest, "Dokument, das", "Dokumente, die")} ich dir einzeln zeige.` : "Danach bist du fertig."}</span>
         <button type="button" class="btn primary tall" data-act="go" ${checked ? "" : "disabled"}>${I.check()} ${checked === 1 ? "1 Dokument einsortieren" : `${checked} Dokumente einsortieren`}</button>
         ${checked === 0 ? `<button type="button" class="btn tall" data-act="goSingle">Einzeln anschauen</button>` : ""}</div>
     </main></div>`);
+  document.querySelectorAll("[data-mixed]").forEach((el) => { el.indeterminate = true; });
   S.actions = {
     back: backFn,
     toggle: (el) => { const id = el.dataset.id; if (el.checked) off.delete(id); else off.add(id); drawBatch(); },
+    toggleGroup: (el) => {
+      const g = groups[+el.dataset.g];
+      const allOn = g.items.every((i) => !off.has(i.id));
+      for (const i of g.items) { if (allOn) off.add(i.id); else off.delete(i.id); }
+      drawBatch();
+    },
+    openGroup: (el) => { const k = groups[+el.dataset.g].key; if (open.has(k)) open.delete(k); else open.add(k); drawBatch(); },
     goSingle: async () => { await tryCall("decline_batch", [...off]); go("single", { origin }); },
     go: async (el) => {
       el.disabled = true;
@@ -668,6 +718,7 @@ function drawSingle() {
           <button type="button" class="btn tall" style="flex:2 1 15rem" data-act="reject">${I.x()} Passt nicht – neuer Vorschlag</button>
           <button type="button" class="btn link tall" style="flex:1 1 8rem" data-act="skip">Später</button>
         </div>
+        <p class="tiny muted keys">Tastatur: <kbd>Enter</kbd> passt so · <kbd>Entf</kbd> passt nicht · <kbd>Leertaste</kbd> später · <kbd>H</kbd> Hinweis</p>
       </div>`;
   }
 

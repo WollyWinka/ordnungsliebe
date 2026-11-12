@@ -321,3 +321,15 @@ input.text:focus { outline: none; border-color: var(--violet); box-shadow: 0 0 0
   .card.big { padding: 1.5rem; }
 }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+/* Sammelliste nach Ordnern */
+.bgroup { display: flex; flex-direction: column; gap: 0.625rem; }
+.bgroup.off .foldertag { background: var(--seg-bg); color: var(--text-2); }
+.bgroup-head { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; background: var(--surface); border: 1px solid var(--border); border-radius: 1.125rem; padding: 0.875rem 1.125rem; }
+.bgroup-check { display: flex; align-items: center; gap: 0.875rem; cursor: pointer; flex-wrap: wrap; flex: 1 1 18rem; }
+.bgroup-check input { width: 1.75rem; height: 1.75rem; accent-color: var(--accent); margin: 0; flex-shrink: 0; cursor: pointer; }
+.bgroup .biglist { padding-left: 1.5rem; }
+.bgroup-head [aria-expanded="true"] svg.chev { transform: rotate(180deg); }
+.keys { text-align: center; margin: 0.25rem 0 0; }
+kbd { font: inherit; font-weight: 600; background: var(--surface-2); border: 1px solid var(--btn-border); border-bottom-width: 2px; border-radius: 0.375rem; padding: 0 0.375rem; }
+@media (max-width: 40rem) { .bgroup .biglist { padding-left: 0; } }
