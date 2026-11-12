@@ -353,3 +353,53 @@ def test_not_a_document_is_never_proposed_again(env):
     assert api.undo(entry["id"])["ok"]
     assert wait_for(lambda: api.pipeline.overview()["total"] >= 1, timeout=20)
     api.shutdown()
+
+
+def _entgelt(path, monat):
+    text_pdf(path, ["Musterfirma GmbH", f"Entgeltnachweis für {monat} 2026",
+                    "Gehalt brutto 3.500,00 EUR", "Lohnsteuer Sozialabgaben Auszahlung"])
+
+
+def test_correction_into_new_subfolder_is_learned_and_pending_ones_rechecked(env):
+    (env["lib"] / "Arbeit" / "Gehalt").mkdir(parents=True)
+    api = make_api(env)
+    _entgelt(env["inbox"] / "e1.pdf", "September")
+    _entgelt(env["inbox"] / "e2.pdf", "Oktober")
+    assert wait_for(lambda: api.pipeline.overview()["total"] == 2 and api.pipeline.overview()["working"] == 0)
+    items = sorted(api.pipeline.items.values(), key=lambda i: i["name"])
+    assert all(i["suggestion"]["folder"] == "Arbeit/Gehalt" for i in items)
+    assert items[0]["suggestion"]["reason"]  # Begründung vorhanden
+    res = api.confirm(items[0]["id"], "Arbeit/Gehalt/Entgeltnachweise", "2026-09 Entgeltnachweis")["data"]
+    assert res["rechecked"] == 1
+    assert wait_for(lambda: api.pipeline.overview()["working"] == 0)
+    second = api.item(items[1]["id"])["data"]
+    assert second["suggestion"]["folder"] == "Arbeit/Gehalt/Entgeltnachweise"
+    mem = api.memory.entries[-1]
+    assert mem["corrected"] and mem["ai_folder"] == "Arbeit/Gehalt" and mem["ai_reason"]
+    entry = api.history.get(api.history_view()["data"]["days"][0]["entries"][0]["id"])
+    assert entry["info"]["corrected"] and entry["info"]["ai_folder"] == "Arbeit/Gehalt"
+    api.shutdown()
+
+
+def test_new_subfolder_during_reorg_is_allowed_and_kept(env):
+    api = make_api(env)
+    lib = env["lib"]
+    (lib / "Alt").mkdir()
+    _entgelt(lib / "Alt" / "a.pdf", "Juli")
+    _entgelt(lib / "Alt" / "b.pdf", "August")
+    assert api.reorg_start("neu")["ok"]
+    assert wait_for(lambda: api.reorganizer.state.get("phase") in ("structure_review", "error"), timeout=120)
+    folders = api.reorg_structure()["data"]["folders"]
+    assert any(f["path"] == "Arbeit/Gehalt" for f in folders)
+    api.reorg_apply(folders)
+    assert wait_for(lambda: api.pipeline.overview("reorg")["working"] == 0 and
+                    api.pipeline.overview("reorg")["total"] >= 2, timeout=60)
+    reorg_items = sorted([i for i in api.pipeline.items.values() if i["origin"] == "reorg"
+                          and "Alt" in i["src"]], key=lambda i: i["name"])
+    api.confirm(reorg_items[0]["id"], "Arbeit/Gehalt/Entgeltnachweise", "2026-07 Entgeltnachweis")
+    assert "Arbeit/Gehalt/Entgeltnachweise" in api.pipeline.reorg_folders
+    assert any(f["path"] == "Arbeit/Gehalt/Entgeltnachweise" for f in api.reorganizer.state["structure"])
+    assert wait_for(lambda: api.pipeline.overview("reorg")["working"] == 0)
+    assert api.item(reorg_items[1]["id"])["data"]["suggestion"]["folder"] == "Arbeit/Gehalt/Entgeltnachweise"
+    assert any(f["path"] == "Arbeit/Gehalt/Entgeltnachweise" for f in api.folders("reorg")["data"])
+    api.shutdown()

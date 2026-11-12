@@ -17,6 +17,8 @@ Regeln:
 - "alternative_folder": der zweitbeste Ordner aus der Liste oder "".
 - "confidence": "sehr sicher", "ziemlich sicher" oder "unsicher". Sei ehrlich: Wenn zwei Ordner gleich gut passen, ist es "unsicher".
 - Ähnliche, vom Nutzer bereits bestätigte Fälle haben Vorrang vor deinem eigenen Gefühl.
+- "reason": ein bis zwei kurze deutsche Sätze, WARUM dieser Ordner passt (z. B. "Entgeltnachweis des Arbeitgebers; der Nutzer legt solche Nachweise in Arbeit/Gehalt/Entgeltnachweise ab."). Schreibe die Begründung, bevor du den Ordner wählst.
+- KORREKTUREN des Nutzers bei ähnlichen Fällen sind verbindlich: Ist das Dokument von derselben Art wie ein korrigierter Fall, wähle den Ordner aus der Korrektur – auch wenn ein übergeordneter Ordner ebenfalls passen würde. Ein spezieller Unterordner, den der Nutzer gewählt hat, schlägt immer den allgemeinen Ordner darüber.
 - Hinweise des Nutzers haben Vorrang vor allem anderen. Ein Hinweis zu genau diesem Dokument gilt für Ordner UND Dateinamen; nennt er einen Ordner, der nicht in der Liste steht, wähle "__NEU__" und trage ihn in "new_folder" ein."""
 
 
@@ -27,13 +29,14 @@ def classify_schema(folders: list[str]) -> dict:
         "properties": {
             "summary": {"type": "string"},
             "doc_date": {"type": "string"},
+            "reason": {"type": "string"},
             "folder": {"type": "string", "enum": choices},
             "new_folder": {"type": "string"},
             "alternative_folder": {"type": "string", "enum": list(folders) + [""]},
             "filename": {"type": "string"},
             "confidence": {"type": "string", "enum": CONFIDENCE_VALUES},
         },
-        "required": ["summary", "doc_date", "folder", "new_folder", "alternative_folder",
+        "required": ["summary", "doc_date", "reason", "folder", "new_folder", "alternative_folder",
                      "filename", "confidence"],
     }
 

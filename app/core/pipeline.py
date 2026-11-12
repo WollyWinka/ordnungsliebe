@@ -55,6 +55,7 @@ class Pipeline:
         self._ignored_inbox: set[str] = set()
         self.reorg_folders: list[str] = []          # erlaubte Ordner während einer Neuordnung
         self.reorg_group: str = ""
+        self.on_reorg_folder_added = None            # Rückruf: neuer Ordner während der Neuordnung
         self._worker = threading.Thread(target=self._work, name="analyse", daemon=True)
         self._poller = threading.Thread(target=self._poll, name="scan-ordner", daemon=True)
 
@@ -263,7 +264,7 @@ class Pipeline:
 
     # --- Abfragen für die Oberfläche ---------------------------------------------
     def _public(self, item: dict, with_text: bool = False) -> dict:
-        out = {k: v for k, v in item.items() if k not in ("text", "page_texts", "fingerprint")}
+        out = {k: v for k, v in item.items() if k not in ("text", "page_texts", "fingerprint", "vec")}
         if with_text:
             out["text_excerpt"] = (item.get("text") or "")[:1500]
         return out
@@ -359,6 +360,13 @@ class Pipeline:
         stem = filename if filename else s.get("filename", src.name)
 
         if item["origin"] == "reorg":
+            if folder and folder not in self.reorg_folders:
+                self.reorg_folders.append(folder)
+                if self.on_reorg_folder_added:
+                    try:
+                        self.on_reorg_folder_added(folder)
+                    except Exception:
+                        log.exception("Neuer Ordner konnte nicht in die Struktur übernommen werden")
             target = target_dir / naming.clean_filename(stem, src.suffix)
             created = [str(p) for p in library.missing_parents(target)]
             if target.resolve() == src.resolve():
@@ -409,10 +417,44 @@ class Pipeline:
                 self.dup.save()
             except OSError:
                 pass
-        self.memory.add(item.get("text", ""), folder, dst.name, ref=entry["id"], original_name=src.name)
+        mem = self.memory.add(item.get("text", ""), folder, dst.name, ref=entry["id"], original_name=src.name,
+                              ai_folder=s.get("folder", ""), ai_reason=s.get("reason", ""),
+                              hint=item.get("hint", ""))
+        self.history.update(entry["id"], info={**entry.get("info", {}), "ai_folder": s.get("folder", ""),
+                                               "reason": s.get("reason", ""), "corrected": mem["corrected"]})
         if s and s.get("is_new_folder") and s.get("folder") == folder:
             self.schemes.set_one(root, folder, "JJJJ-MM Dokumentart", dst.stem)
-        return {"dst": str(dst), "folder_display": naming.display_folder(folder), "name": dst.name}
+        rechecked = 0
+        if mem["corrected"]:
+            rechecked = self.recheck_similar(item.get("text", ""), exclude=item_id, origin=item["origin"],
+                                             keep_if_folder=folder)
+        return {"dst": str(dst), "folder_display": naming.display_folder(folder), "name": dst.name,
+                "rechecked": rechecked}
+
+    def recheck_similar(self, text: str, exclude: str = "", origin: str | None = None,
+                        keep_if_folder: str = "", min_score: float = 0.3) -> int:
+        """Lässt fertige Vorschläge ähnlicher Dokumente neu berechnen (nach Korrektur oder Hinweis)."""
+        vec = textsim.vector((text or "")[:3000])
+        if not vec:
+            return 0
+        hits = []
+        with self._lock:
+            for it in self.items.values():
+                if (it["id"] == exclude or it["status"] != "ready" or it["stage"] != "doc"
+                        or (origin and it["origin"] != origin) or not it.get("suggestion")):
+                    continue
+                if keep_if_folder and it["suggestion"].get("folder") == keep_if_folder:
+                    continue
+                if "vec" not in it:
+                    it["vec"] = textsim.vector((it.get("text") or "")[:3000])
+                if textsim.cosine(vec, it["vec"]) >= min_score:
+                    hits.append(it)
+            for it in hits:
+                it.update(status="waiting", suggestion=None, batch_declined=False)
+                self._jobs.put((PRIO_USER, next(self._seq), it["id"], "classify"))
+        if hits:
+            self._changed()
+        return len(hits)
 
     def confirm_batch(self, item_ids: list[str]) -> int:
         done = 0
@@ -457,6 +499,8 @@ class Pipeline:
         item["excluded"] = []  # der Hinweis darf auch einen vorher abgelehnten Ordner begründen
         item.update(status="waiting", suggestion=None)
         self._jobs.put((PRIO_USER, next(self._seq), item_id, "classify"))
+        if remember:
+            self.recheck_similar(item.get("text", ""), exclude=item_id, origin=item["origin"])
         self._changed()
 
     def mark_not_document(self, item_id: str, reason: str = "foto") -> None:

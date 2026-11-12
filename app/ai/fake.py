@@ -67,6 +67,12 @@ class FakeAI:
                 if f != prompts.NEW_FOLDER and f.split("/")[-1].lower() in hint:
                     return {"summary": "Nach Hinweis eingeordnet", "doc_date": "", "folder": f, "new_folder": "",
                             "alternative_folder": "", "filename": "2026-11 Dokument", "confidence": "sehr sicher"}
+        corr = re.findall(r"→ Ordner: (.+?), Dateiname: .*?\(KORREKTUR", user)
+        for f in corr:  # Test-KI: Korrekturen bei ähnlichen Fällen übernehmen
+            if f in allowed:
+                return {"summary": "Wie zuvor korrigiert", "doc_date": "", "reason": "Wie bei der Korrektur des Nutzers.",
+                        "folder": f, "new_folder": "", "alternative_folder": "", "filename": "2026-11 Dokument",
+                        "confidence": "sehr sicher"}
         folder, doc_type, hits, new_folder = None, "Dokument", 0, ""
         # Regeln sind von speziell nach allgemein sortiert: die erste passende gewinnt.
         for words, target, dtype in KEYWORDS:
@@ -91,6 +97,7 @@ class FakeAI:
         real = [f for f in allowed if f not in (prompts.NEW_FOLDER, folder)]
         return {
             "summary": f"{doc_type} vom {date}",
+            "reason": f"Stichwort für {doc_type} gefunden.",
             "doc_date": date,
             "folder": folder,
             "new_folder": new_folder if folder == prompts.NEW_FOLDER else "",

@@ -214,7 +214,7 @@ function confirmDialog(title, text, okLabel, danger) {
 async function pickFolder(origin, current) {
   const list = (await tryCall("folders", origin)) || [];
   let filter = "";
-  const allowNew = origin !== "reorg";
+  const allowNew = true;
   const draw = () => {
     const f = filter.toLowerCase();
     const items = list.filter((x) => !f || x.display.toLowerCase().includes(f));
@@ -226,9 +226,9 @@ async function pickFolder(origin, current) {
     <input class="text" type="search" placeholder="Ordner suchen …" aria-label="Ordner suchen" data-input="filter">
     <ul class="folderlist"></ul>
     ${allowNew ? `<div class="stack g8"><span class="label">Oder neuen Ordner anlegen</span>
-      <div class="row g8"><input class="text" id="newfolder" placeholder="z. B. Versicherungen/Haftpflicht" aria-label="Neuer Ordner">
+      <div class="row g8"><input class="text" id="newfolder" value="${esc(current ? current + "/" : "")}" placeholder="z. B. Versicherungen/Haftpflicht" aria-label="Neuer Ordner">
       <button type="button" class="btn" data-act="new">Anlegen</button></div>
-      <span class="tiny muted">Unterordner mit „/“ trennen.</span></div>` : ""}
+      <span class="tiny muted">Unterordner mit „/“ trennen – z. B. „Arbeit/Gehalt/Entgeltnachweise“. Ich merke mir, dass solche Dokumente künftig dorthin gehören.</span></div>` : ""}
     <div class="btns"><button type="button" class="btn" data-act="cancel">Abbrechen</button></div>`, {
     filter: (el) => { filter = el.value; draw(); },
     pick: (el) => closeModal(el.dataset.path),
@@ -596,6 +596,7 @@ function drawSingle() {
     const [stem, ext] = splitName(s.filename);
     right = `<div class="stack g8"><span class="eyebrow">Mein Vorschlag</span><h1 class="suggest-title">${esc(s.summary || stem)}</h1></div>
       ${confBox(it)}
+      ${s.reason ? `<p class="small muted" style="margin-top:-0.5rem"><b style="color:var(--text-2)">Warum:</b> ${esc(s.reason)}</p>` : ""}
       <div class="card stack g20">
         <div class="stack g10"><span class="label">Ordner</span>
           <div class="row g12 wrapflex"><div class="value grow" style="flex-basis:15rem"><span style="color:var(--violet)">${I.folder()}</span> ${esc(s.folder_display)}
@@ -668,7 +669,7 @@ function drawSingle() {
       const s = it.suggestion;
       const res = await tryCall("confirm", it.id, s.folder, s.filename);
       if (res) {
-        toast(`Abgelegt in ${res.folder_display}`);
+        toast(res.rechecked ? `Abgelegt in ${res.folder_display}. Ich passe ${plural(res.rechecked, "ähnlichen Vorschlag", "ähnliche Vorschläge")} an.` : `Abgelegt in ${res.folder_display}`);
         loadNextSingle();
       } else el.disabled = false;
     },

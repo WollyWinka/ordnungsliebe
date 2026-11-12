@@ -55,10 +55,20 @@ def classify(ai, *, text: str, original: Path, kind: str, page_count: int,
     user = [f"Ordnerstruktur:\n{folder_block}"]
     if examples:
         ex_lines = []
-        for i, e in enumerate(examples, 1):
+        ordered = sorted(examples, key=lambda e: not e.get("corrected"))  # Korrekturen zuerst
+        for i, e in enumerate(ordered, 1):
             snippet = re.sub(r"\s+", " ", e.get("text", ""))[:300]
-            ex_lines.append(f"{i}) Text: «{snippet}» → Ordner: {e['folder']}, Dateiname: {e['filename']}")
-        user.append("Ähnliche, vom Nutzer bereits bestätigte Fälle:\n" + "\n".join(ex_lines))
+            if e.get("corrected"):
+                why = f'; deine Begründung damals: „{e["ai_reason"]}“' if e.get("ai_reason") else ""
+                note = f"KORREKTUR – du hattest {e['ai_folder']} vorgeschlagen{why}, der Nutzer hat {e['folder']} gewählt"
+            elif e.get("ai_folder"):
+                note = "dein Vorschlag wurde bestätigt"
+            else:
+                note = "vom Nutzer so abgelegt"
+            if e.get("hint"):
+                note += f'; Hinweis des Nutzers: „{e["hint"]}“'
+            ex_lines.append(f"{i}) Text: «{snippet}» → Ordner: {e['folder']}, Dateiname: {e['filename']} ({note})")
+        user.append("Ähnliche, vom Nutzer bereits entschiedene Fälle:\n" + "\n".join(ex_lines))
     if user_hints:
         user.append("Allgemeine Hinweise des Nutzers (immer beachten):\n" + "\n".join(f"- {h}" for h in user_hints))
     if excluded:
@@ -113,7 +123,10 @@ def _postprocess(raw: dict, *, original: Path, kind: str, folders: list[str], ex
     if examples:
         top = examples[0]
         if top.get("score", 0) >= 0.35:
-            score += 0.06 if top["folder"] == folder else -0.15
+            if top["folder"] == folder:
+                score += 0.06
+            else:
+                score -= 0.25 if top.get("corrected") else 0.15
     if is_new:
         score = min(score, 0.7)
     if excluded:
@@ -128,6 +141,7 @@ def _postprocess(raw: dict, *, original: Path, kind: str, folders: list[str], ex
         "alt_folder": alt,
         "filename": filename,
         "summary": str(raw.get("summary") or "").strip()[:200],
+        "reason": str(raw.get("reason") or "").strip()[:300],
         "doc_date": str(raw.get("doc_date") or ""),
         "confidence": round(score, 2),
     }

@@ -96,6 +96,7 @@ class Reorganizer:
         self.state: dict = jsonfile.load(self.state_path, {})
         self._thread: threading.Thread | None = None
         self._cancel = threading.Event()
+        pipeline.on_reorg_folder_added = self._folder_added
         # Nach einem Neustart: laufende Phase zurück auf einen sicheren Punkt setzen
         if self.state.get("phase") in ("backup", "reading", "structure"):
             self.state.update(phase="cancelled")
@@ -300,6 +301,13 @@ class Reorganizer:
         self._requeue_review()
         self.bus.emit("reorg", self.status())
         return self.status()
+
+    def _folder_added(self, folder: str) -> None:
+        struct = self.state.setdefault("structure", [])
+        if not any(f["path"] == folder for f in struct):
+            struct.append({"path": folder, "scheme": "JJJJ-MM Dokumentart", "example": ""})
+            self._save()
+            self.schemes.set_one(self.root, folder, "JJJJ-MM Dokumentart", "")
 
     def _requeue_review(self) -> None:
         folders = [f["path"] for f in self.state.get("structure", [])]
