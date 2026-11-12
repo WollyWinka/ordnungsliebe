@@ -672,3 +672,75 @@ def test_search_index_and_collections(env, monkeypatch):
     # Öffnen nur für Dateien der Ablage
     assert not api.open_file("/etc/passwd")["ok"]
     api.shutdown()
+
+
+def _skewed_scan(path, lines, angle):
+    import io as _io
+    from PIL import Image, ImageDraw, ImageFont
+    import pymupdf as _pm
+    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 34)
+    doc = _pm.open()
+    for spec in (lines, None, lines):  # Seite 2 ist leer (Rückseite)
+        img = Image.new("L", (1240, 1754), 255)
+        if spec:
+            d = ImageDraw.Draw(img)
+            for k, line in enumerate(spec * 4):
+                d.text((110, 150 + 60 * k), line, fill=0, font=font)
+        else:
+            d = ImageDraw.Draw(img)
+            d.point([(400, 900), (401, 900), (900, 300)], fill=90)  # Staub
+        img = img.rotate(angle if spec else 0, fillcolor=255, resample=Image.BICUBIC)
+        buf = _io.BytesIO()
+        img.save(buf, "PNG")
+        page = doc.new_page(width=595, height=842)
+        page.insert_image(page.rect, stream=buf.getvalue())
+    doc.save(str(path))
+    return path
+
+
+def test_scan_enhance_removes_blank_deskews_and_keeps_original(env):
+    from app.docs import enhance
+    from PIL import Image
+    import pymupdf as _pm
+    src = _skewed_scan(env["tmp"] / "schief.pdf", ["Stadtwerke Bamberg Stromabrechnung", "Abschlag Strom und Gas 80 Euro"], 2.5)
+    page = _pm.open(str(src))[0]
+    img = enhance._render(page, 150).convert("L")
+    assert abs(enhance.skew_angle(img) + 2.5) < 0.4
+    straight = img.rotate(-2.5, fillcolor=255)  # gerade gedreht
+    assert abs(enhance.skew_angle(straight)) < 0.3
+
+    api = make_api(env)
+    shutil.copy(src, env["inbox"] / "Scan_0099.pdf")
+    item = _one_item(api)
+    res = api.confirm(item["id"])["data"]
+    assert res["removed_pages"] == 1
+    out = _pm.open(res["dst"])
+    assert out.page_count == 2 and "Stadtwerke" in out[0].get_text()
+    out.close()
+    assert Path(res["dst"]).stat().st_size < src.stat().st_size
+    entry = api.history_view()["data"]["days"][0]["entries"][0]
+    info = api.history.get(entry["id"])["info"]
+    assert info["cleaned"]["removed"] == [2] and info["cleaned"]["deskewed"] == 2
+    # Original liegt unverändert bereit; Rückgängig holt es zurück
+    assert Path(info["original"]).read_bytes() == src.read_bytes()
+    assert api.undo(entry["id"])["ok"]
+    assert (env["inbox"] / "Scan_0099.pdf").read_bytes() == src.read_bytes()
+    api.shutdown()
+
+
+def test_scan_enhance_can_be_switched_off_and_originals_expire(env):
+    import time as _t
+    import pymupdf as _pm
+    api = make_api(env)
+    api.save_settings({"scan_enhance": False})
+    src = _skewed_scan(env["tmp"] / "s.pdf", ["Sparkasse Bamberg Kontoauszug Girokonto"], 0)
+    shutil.copy(src, env["inbox"] / "Scan_1.pdf")
+    item = _one_item(api)
+    res = api.confirm(item["id"])["data"]
+    assert res["removed_pages"] == 0 and _pm.open(res["dst"]).page_count == 3
+    entry = api.history.recent(1)[0] if hasattr(api.history, "recent") else api.history.entries[-1]
+    orig = Path(entry["info"]["original"])
+    assert orig.exists() and api._purge_originals(30) == 0
+    entry["ts"] = _t.time() - 31 * 86400
+    assert api._purge_originals(30) == 1 and not orig.exists()
+    api.shutdown()

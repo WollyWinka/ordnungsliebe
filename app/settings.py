@@ -23,6 +23,7 @@ class Settings:
     batch_level: str = "mittel"   # wenig | mittel | viel
     keep_cloud_local: bool = True
     auto_update: bool = True
+    scan_enhance: bool = True       # leere Seiten entfernen, gerade richten, verkleinern
     persons: list = field(default_factory=list)   # Personen im Haushalt
     person_mode: str = "dateiname"  # dateiname | unterordner | merken
     first_run_choice: str = ""    # "reorg" | "direct" – nur zur Anzeige

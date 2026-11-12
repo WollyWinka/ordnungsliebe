@@ -1108,7 +1108,8 @@ function drawSingle() {
       const s = it.suggestion;
       const res = await tryCall("confirm", it.id, s.folder, s.filename, { deadlines: s.deadlines || [], person: s.person || "" });
       if (res) {
-        toast(res.rechecked ? `Abgelegt in ${res.folder_display}. Ich passe ${plural(res.rechecked, "ähnlichen Vorschlag", "ähnliche Vorschläge")} an.` : `Abgelegt in ${res.folder_display}`);
+        const extra = res.removed_pages ? ` ${plural(res.removed_pages, "leere Seite", "leere Seiten")} entfernt.` : "";
+        toast((res.rechecked ? `Abgelegt in ${res.folder_display}. Ich passe ${plural(res.rechecked, "ähnlichen Vorschlag", "ähnliche Vorschläge")} an.` : `Abgelegt in ${res.folder_display}.`) + extra);
         loadNextSingle();
       } else el.disabled = false;
     },
@@ -1422,6 +1423,9 @@ SCREENS.settings = () => {
           <div class="stack g10"><span class="tiny muted">Wie viele Dokumente darf ich dir gesammelt zum Abhaken zeigen?</span>
           ${seg("batch_level", [["wenig", "Wenige"], ["mittel", "Ausgewogen"], ["viel", "Viele"]])}
           <span class="tiny muted">${esc(hints[s.batch_level] || "")}</span></div>
+          <hr class="hr">
+          <button type="button" class="switch" aria-pressed="${s.scan_enhance !== false}" data-act="scanEnhance"><span class="track"><span class="knob"></span></span>Scans aufbereiten</button>
+          <span class="tiny muted">Leere Seiten entfernen, schiefe Seiten gerade richten und die Datei verkleinern. Das Original hebe ich 30 Tage lang auf – „Rückgängig“ holt es zurück.</span>
         </section>
         <section class="card stack g16"><h2 style="font-size:1.3125rem">KI und Sicherungen</h2>
           <div class="row g12 wrapflex"><div class="stack g4 grow" style="flex-basis:14rem"><span class="tiny muted">KI</span>
@@ -1484,6 +1488,7 @@ SCREENS.settings = () => {
       const list = (s.persons || []).filter((_, i) => i !== +el.dataset.i);
       if (await tryCall("save_settings", { persons: list })) { await refreshState(); render(); }
     },
+    scanEnhance: async () => { if (await tryCall("save_settings", { scan_enhance: s.scan_enhance === false })) { await refreshState(); render(); } },
     autoUpdate: async () => { if (await tryCall("save_settings", { auto_update: s.auto_update === false })) { await refreshState(); render(); } },
     checkUpdate: async (el) => {
       if ((S.state.update || {}).available) { updateDialog(); return; }

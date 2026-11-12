@@ -485,11 +485,13 @@ class Pipeline:
                                      created_dirs=created)
         else:
             converted = None
+            enh_report: dict = {}
             if item["kind"] in ("pdf", "image"):
                 tmp = paths.cache_dir() / "umwandlung" / f"{item_id}.pdf"
                 try:
                     tmp.unlink(missing_ok=True)
-                    if ocr.make_searchable_pdf(src, tmp):
+                    if ocr.make_searchable_pdf(src, tmp, enhance=self.settings.scan_enhance,
+                                               page_texts=item.get("page_texts"), report=enh_report):
                         converted = tmp
                 except Exception:
                     log.exception("Durchsuchbares PDF konnte nicht erstellt werden")
@@ -517,6 +519,7 @@ class Pipeline:
             dst_sha = reader.file_hash(dst)
             entry = self.history.add("move", str(src), str(dst), folder,
                                      original=str(original_store) if original_store else "",
+                                     cleaned={k: v for k, v in enh_report.items() if v} if converted else {},
                                      dst_sha=dst_sha, dst_size=dst.stat().st_size, created_dirs=created)
             try:
                 self.dup.add_file(dst, dst_sha, item.get("fingerprint"))
@@ -540,8 +543,9 @@ class Pipeline:
         if mem["corrected"]:
             rechecked = self.recheck_similar(item.get("text", ""), exclude=item_id, origin=item["origin"],
                                              keep_if_folder=folder)
+        cleaned = (entry.get("info") or {}).get("cleaned") or {}
         return {"dst": str(dst), "folder_display": naming.display_folder(folder), "name": dst.name,
-                "rechecked": rechecked}
+                "rechecked": rechecked, "removed_pages": len(cleaned.get("removed", []))}
 
     def _record_meta(self, item: dict, path: Path, folder: str, s: dict, sha: str = "", entry_id: str = "") -> None:
         try:

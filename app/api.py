@@ -134,6 +134,7 @@ class Api:
         self._started = True
         try:
             library.purge_quarantine(30)
+            self._purge_originals(30)
             if self.reorganizer.state.get("phase") not in ("backup",):
                 self.backups.purge_orphans()
         except Exception:
@@ -145,6 +146,24 @@ class Api:
         if s.setup_done and (spec is None or spec.installed or os.environ.get("ORDNUNGSLIEBE_FAKE_AI")):
             threading.Thread(target=self._warmup, daemon=True).start()
         self.index_library_async()
+
+    def _purge_originals(self, days: int) -> int:
+        """Original-Scans werden 30 Tage aufbewahrt (für „Rückgängig“), danach gilt die aufbereitete Fassung."""
+        limit = time.time() - days * 86400
+        store = (paths.local_dir() / "Originale").resolve()
+        removed = 0
+        for e in list(self.history.entries):
+            orig = (e.get("info") or {}).get("original")
+            if e.get("action") != "move" or not orig or e.get("ts", time.time()) > limit:
+                continue
+            p = Path(orig)
+            try:
+                if p.is_file() and p.resolve().parent == store:
+                    p.unlink()
+                    removed += 1
+            except OSError:
+                pass
+        return removed
 
     def index_library_async(self) -> None:
         def run():
@@ -293,7 +312,7 @@ class Api:
 
     @api_method
     def save_settings(self, changes: dict):
-        allowed = {"font_size", "theme", "batch_level", "inbox_dir", "library_dir", "keep_cloud_local", "auto_update",
+        allowed = {"font_size", "theme", "batch_level", "inbox_dir", "library_dir", "keep_cloud_local", "auto_update", "scan_enhance",
                    "persons", "person_mode"}
         changes = dict(changes or {})
         if "persons" in changes:

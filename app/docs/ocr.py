@@ -117,7 +117,8 @@ def _has_signature(doc: "pymupdf.Document") -> bool:
     return False
 
 
-def make_searchable_pdf(src: Path, dst: Path) -> bool:
+def make_searchable_pdf(src: Path, dst: Path, *, enhance: bool = False, page_texts: list[str] | None = None,
+                        report: dict | None = None) -> bool:
     """Schreibt eine durchsuchbare PDF-Fassung von src nach dst.
 
     Gibt True zurück, wenn eine neue, geprüfte Datei geschrieben wurde. Unverändert bleiben:
@@ -139,6 +140,17 @@ def make_searchable_pdf(src: Path, dst: Path) -> bool:
     else:
         doc = image_to_pdf(src)
     expected = doc.page_count
+    if enhance:
+        from . import enhance as _enh
+        try:
+            new, rep = _enh.enhance(doc, page_texts)
+            if new is not doc and new.page_count == expected - len(rep["removed"]) and new.page_count > 0:
+                doc.close()
+                doc, expected = new, new.page_count
+                if report is not None:
+                    report.update(rep)
+        except Exception:
+            log.exception("Scan konnte nicht aufbereitet werden – es bleibt beim Original")
     try:
         add_text_layer(doc)
         dst.parent.mkdir(parents=True, exist_ok=True)
