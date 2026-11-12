@@ -73,6 +73,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("ORDNUNGSLIEBE_LOCAL", str(tmp_path / "local"))
     monkeypatch.setenv("ORDNUNGSLIEBE_FAKE_AI", "1")
     monkeypatch.setenv("ORDNUNGSLIEBE_FAKE_HW", "16,32")
+    monkeypatch.setenv("ORDNUNGSLIEBE_NO_UPDATE", "1")
     monkeypatch.setattr("app.core.pipeline.POLL_SECONDS", 0.5)
     monkeypatch.setattr("send2trash.send2trash", lambda p: os.remove(p))
     inbox = tmp_path / "Scans"

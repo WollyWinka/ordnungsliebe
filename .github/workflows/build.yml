@@ -97,6 +97,8 @@ jobs:
           make_latest: true
           files: dist/Ordnungsliebe-Setup.exe
           body: |
+            ${{ github.event.head_commit.message }}
+
             **Installation:** `Ordnungsliebe-Setup.exe` herunterladen und doppelt anklicken.
 
             Beim ersten Start lädt Ordnungsliebe einmalig die KI herunter (je nach Computer 2–9 GB).

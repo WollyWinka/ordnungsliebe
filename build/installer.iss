@@ -54,6 +54,7 @@ Name: "{userdesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: deskto
 [Run]
 Filename: "{tmp}\MicrosoftEdgeWebview2Setup.exe"; Parameters: "/silent /install"; StatusMsg: "Anzeige-Komponente von Windows wird eingerichtet …"; Check: NeedsWebView2; Flags: waituntilterminated
 Filename: "{app}\{#MyAppExe}"; Description: "Ordnungsliebe jetzt starten"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExe}"; Flags: nowait; Check: IsUpdate
 
 [Code]
 const
@@ -65,6 +66,11 @@ var
   V: String;
 begin
   Result := RegQueryStringValue(Root, Key, 'pv', V) and (V <> '') and (V <> '0.0.0.0');
+end;
+
+function IsUpdate: Boolean;
+begin
+  Result := Pos('/UPDATE', UpperCase(GetCmdTail)) > 0;
 end;
 
 function NeedsWebView2: Boolean;

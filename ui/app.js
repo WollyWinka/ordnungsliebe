@@ -287,6 +287,34 @@ async function browseFolder(start, title, allowCreate) {
   return p;
 }
 
+/* Update-Dialog */
+function updateDialogBody() {
+  const u = (S.state && S.state.update) || {};
+  let action;
+  if (u.state === "downloading") action = `<div class="stack g8"><div class="progress"><div style="width:${u.percent || 0}%"></div></div><span class="small muted">Wird geladen … ${Math.round(u.percent || 0)} %</span></div>`;
+  else if (u.state === "ready") action = `<button type="button" class="btn primary tall" data-act="install">${I.check()} Jetzt installieren und neu starten</button>`;
+  else if (u.state === "installing") action = `<div class="row g12"><div class="spinner small"></div><span>Ordnungsliebe schließt sich kurz und startet gleich neu …</span></div>`;
+  else action = `<button type="button" class="btn primary tall" data-act="download">Neue Version laden (${Math.round((u.size || 0) / 1e6)} MB)</button>`;
+  return `<h2>Neue Version ${esc(u.version || "")}</h2>
+    ${u.notes && u.notes.length ? `<div class="stack g4"><span class="label">Was ist neu?</span><ul style="margin:0;padding-left:1.25rem;color:var(--text-2)">${u.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul></div>` : ""}
+    <p class="small muted">Laufende Arbeit wird vorher gesichert – eine Neuordnung macht danach genau dort weiter. ${u.can_install ? "" : "(Im Testbetrieb lässt sich nicht installieren.)"}</p>
+    ${u.error && u.state === "error" ? `<div class="notice warn">${I.warn()}<div>${esc(u.error)}</div></div>` : ""}
+    <div class="row between wrapflex g12"><button type="button" class="btn" data-act="close">Später</button>${action}</div>`;
+}
+
+function updateDialogRefresh() {
+  const box = $modal.querySelector(".upd");
+  if (box) box.innerHTML = updateDialogBody();
+}
+
+function updateDialog() {
+  openModal(`<div class="upd stack g20">${updateDialogBody()}</div>`, {
+    close: () => closeModal(null),
+    download: async () => { const r = await tryCall("update_download"); if (r) { S.state.update = r; updateDialogRefresh(); } },
+    install: async () => { S.state.update.state = "installing"; updateDialogRefresh(); await tryCall("update_install"); },
+  });
+}
+
 /* ===================== Ereignisse vom Programm ===================== */
 
 const HANDLERS = {
@@ -314,6 +342,12 @@ const HANDLERS = {
     else if (S.route === "home") render();
   },
   reorg_item_done() { /* über queue abgedeckt */ },
+  update(p) {
+    if (!S.state) return;
+    S.state.update = p;
+    updateDialogRefresh();
+    if (S.route === "home") render();
+  },
   scanfinder(p) {
     S.setup.finder = p;
     if (p.state === "found") {
@@ -388,11 +422,17 @@ SCREENS.home = () => {
     ? `<div class="notice info">${I.layers(24)}<div class="grow"><b>Die Neuordnung deiner Ablage läuft noch.</b>
        Du kannst jederzeit weitermachen.</div><button type="button" class="btn small violet" data-act="reorg">Weitermachen</button></div>` : "";
 
+  const up = st.update || {};
+  const updateBanner = up.available
+    ? `<div class="notice ok">${I.check(24, 2.2)}<div class="grow"><b>Es gibt eine neue Version (${esc(up.version)}).</b>
+       Mit einem Klick ist sie installiert – deine Arbeit bleibt erhalten.</div>
+       <button type="button" class="btn small" data-act="update">Ansehen</button></div>` : "";
   setHTML(`<div class="screen">
     <header class="home-head"><div class="brand"><div class="logo">${I.logo()}</div><span class="brand-name">Ordnungsliebe</span></div>
     <div class="pill">${pill}</div></header>
     <main class="wrap">
       <div class="stack g10"><h1 class="title xl">Hallo! Was möchtest du heute tun?</h1><p class="lead">${esc(sub)}</p></div>
+      ${updateBanner}
       ${reorgBanner}
       ${hero}
       <div class="tiles">
@@ -410,6 +450,7 @@ SCREENS.home = () => {
     startReview: () => startReview("inbox"),
     reorg: () => go("reorg"),
     resumeReorg: async () => { const r = await tryCall("reorg_resume"); if (r) { S.state.reorg = r; go("reorg"); } },
+    update: () => updateDialog(),
     history: () => go("history"),
     settings: () => go("settings"),
   };
@@ -971,6 +1012,12 @@ SCREENS.settings = () => {
           <button type="button" class="textbtn" style="align-self:flex-start" data-act="forget">Gelerntes vergessen und neu anfangen …</button>
         </section>
       </div>
+      <section class="card stack g16"><h2 style="font-size:1.3125rem">Programm</h2>
+        <div class="row between wrapflex g12"><span>Ordnungsliebe ${esc(S.state.version)}${(S.state.update || {}).available ? ` · <b>neue Version ${esc(S.state.update.version)} verfügbar</b>` : ""}</span>
+          <button type="button" class="btn small violet" data-act="checkUpdate">${(S.state.update || {}).available ? "Ansehen" : "Nach Updates suchen"}</button></div>
+        <button type="button" class="switch" aria-pressed="${s.auto_update !== false}" data-act="autoUpdate"><span class="track"><span class="knob"></span></span>Beim Start automatisch nach neuen Versionen suchen</button>
+        <span class="tiny muted">Dafür fragt Ordnungsliebe nur die Versionsnummer bei GitHub ab. Deine Dokumente verlassen nie den Computer.</span>
+      </section>
       <section class="card stack g16" id="hints-card"><h2 style="font-size:1.3125rem">Das habe ich mir gemerkt</h2>
         <div class="waiting" style="padding:1rem"><div class="spinner small"></div></div></section>
       <p class="tiny muted">Ordnungsliebe ${esc(S.state.version)}</p>
@@ -994,6 +1041,14 @@ SCREENS.settings = () => {
     },
     models: () => modelDialog(),
     backups: () => backupsDialog(),
+    autoUpdate: async () => { if (await tryCall("save_settings", { auto_update: s.auto_update === false })) { await refreshState(); render(); } },
+    checkUpdate: async (el) => {
+      if ((S.state.update || {}).available) { updateDialog(); return; }
+      el.disabled = true; el.textContent = "Suche …";
+      const r = await tryCall("update_check");
+      if (r) { S.state.update = r; if (r.available) updateDialog(); else toast(r.error || "Du hast schon die neueste Version."); }
+      render();
+    },
     hintEdit: async (el) => {
       const v = el.value.trim();
       if (!v) return;

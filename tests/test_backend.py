@@ -510,3 +510,36 @@ def test_restart_during_reading_resumes(env, monkeypatch):
     assert len(seen) == 9 - done_first
     assert len(api2.reorganizer.state["docs"]) == 9
     api2.shutdown()
+
+
+def test_updater_detects_downloads_and_verifies(env, monkeypatch):
+    from app.core import updater as up
+    payload = b"MZ" + b"x" * 5000
+
+    class Resp:
+        def __init__(self, data=None, body=b""):
+            self._data, self._body = data, body
+            self.headers = {"Content-Length": str(len(body))}
+        def raise_for_status(self): pass
+        def json(self): return self._data
+        def iter_content(self, n):
+            for i in range(0, len(self._body), n):
+                yield self._body[i:i + n]
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    release = {"tag_name": "v9.9.9", "body": "Neue Funktion: Suche\n\nCo-Authored-By: X\n**Installation:** …",
+               "assets": [{"name": "Ordnungsliebe-Setup.exe", "size": len(payload),
+                           "browser_download_url": "https://example.invalid/setup.exe"}]}
+    monkeypatch.setattr(up.requests, "get",
+                        lambda url, **k: Resp(data=release) if "api.github.com" in url else Resp(body=payload))
+    api = make_api(env)
+    st = api.update_check()["data"]
+    assert st["available"] and st["version"] == "9.9.9"
+    assert st["notes"] == ["Neue Funktion: Suche"]
+    assert api.update_download()["ok"]
+    assert wait_for(lambda: api.updater.state == "ready", timeout=10)
+    assert api.updater.file.read_bytes() == payload
+    r = api.update_install()  # Testumgebung ist keine installierte Windows-Version
+    assert not r["ok"]
+    api.shutdown()

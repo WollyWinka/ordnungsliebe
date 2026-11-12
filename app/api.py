@@ -104,6 +104,8 @@ class Api:
         self.reorganizer = reorg.Reorganizer(self.settings_store, self.ai, self.pipeline, self.history,
                                              self.schemes, self.dup, self.backups, bus)
         self.models = setup.ModelManager(self.settings_store, bus)
+        from .core.updater import Updater
+        self.updater = Updater(self.settings_store, bus)
         self.scanfinder = setup.ScanFinder(bus)
         self._started = False
 
@@ -127,6 +129,7 @@ class Api:
         except Exception:
             log.exception("Aufräumen beim Start fehlgeschlagen")
         self.pipeline.start()
+        self.updater.check_in_background()
         s = self.settings_store.get()
         spec = models.get(s.model_id)
         if s.setup_done and (spec is None or spec.installed or os.environ.get("ORDNUNGSLIEBE_FAKE_AI")):
@@ -186,11 +189,12 @@ class Api:
             "memory_count": self.memory.count(),
             "last_backup": backups[0] if backups else None,
             "fake_ai": bool(os.environ.get("ORDNUNGSLIEBE_FAKE_AI")),
+            "update": self.updater.status(),
         }
 
     @api_method
     def save_settings(self, changes: dict):
-        allowed = {"font_size", "theme", "batch_level", "inbox_dir", "library_dir", "keep_cloud_local"}
+        allowed = {"font_size", "theme", "batch_level", "inbox_dir", "library_dir", "keep_cloud_local", "auto_update"}
         changes = changes or {}
         if "inbox_dir" in changes or "library_dir" in changes:
             cur = self.settings_store.get()
@@ -248,6 +252,37 @@ class Api:
             os.startfile(str(p))  # type: ignore[attr-defined]
         else:
             subprocess.Popen(["xdg-open", str(p)])
+        return True
+
+    # --- Updates --------------------------------------------------------------------
+    @api_method
+    def update_check(self):
+        return self.updater.check()
+
+    @api_method
+    def update_download(self):
+        self.updater.download()
+        return self.updater.status()
+
+    @api_method
+    def update_install(self):
+        """Neuordnung pausieren, alles sichern, Installation starten, Fenster schließen."""
+        self.reorganizer.pause()
+        t = self.reorganizer._thread
+        if t is not None:
+            t.join(timeout=30)
+        self.pipeline._persist()
+        self.updater.install()
+
+        def close():
+            time.sleep(1.5)
+            self.shutdown()
+            if self._window is not None:
+                try:
+                    self._window.destroy()
+                except Exception:
+                    os._exit(0)
+        threading.Thread(target=close, daemon=True).start()
         return True
 
     # --- Einrichtung ----------------------------------------------------------------

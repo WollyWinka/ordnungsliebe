@@ -22,6 +22,7 @@ class Settings:
     theme: str = "auto"           # auto | hell | dunkel
     batch_level: str = "mittel"   # wenig | mittel | viel
     keep_cloud_local: bool = True
+    auto_update: bool = True
     first_run_choice: str = ""    # "reorg" | "direct" – nur zur Anzeige
     extra: dict = field(default_factory=dict)
 
