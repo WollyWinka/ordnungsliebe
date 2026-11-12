@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import time
 from pathlib import Path
 
 import pymupdf
@@ -775,3 +776,93 @@ def test_blank_detection_keeps_signature_and_faint_pages(env):
     # Ohne verlässliche Texterkennung wird nichts entfernt
     out2, rep2 = enhance.enhance(doc, ["", "", "", ""])
     assert rep2["removed"] == [] and out2.page_count == 4
+
+
+def test_inventory_check_finds_tax_and_deadlines_without_moving(env):
+    import datetime as dt
+    lib = env["lib"]
+    due = (dt.date.today() + dt.timedelta(days=20)).strftime("%d.%m.%Y")
+    text_pdf(lib / "Finanzen" / "Spende Tierheim.pdf", ["Tierheim Bamberg", "Zuwendungsbestätigung Spende 50 Euro"])
+    text_pdf(lib / "Wohnen" / "Strom & Gas" / "Abschlag.pdf", ["Stadtwerke", f"Abschlag zahlbar bis {due}"])
+    text_pdf(lib / "Wohnen" / "Alt.pdf", ["Stadtwerke", "Rechnung zahlbar bis 01.02.2024"])
+    before = sorted(str(p) for p in lib.rglob("*") if p.is_file())
+    api = make_api(env)
+    assert api.inspect_start()["ok"]
+    assert wait_for(lambda: api.inspector.status()["phase"] == "done", timeout=60)
+    st = api.inspector.status()
+    assert st["total"] == 4 and st["done"] == 4 and st["found_tax"] == 1 and st["found_deadlines"] == 1
+    assert sorted(str(p) for p in lib.rglob("*") if p.is_file()) == before  # nichts verschoben
+    dls = api.deadlines()["data"]
+    assert len(dls) == 1 and dls[0]["name"] == "Abschlag.pdf"  # alte Frist von 2024 wird nicht gezeigt
+    year = str(dt.date.today().year)
+    assert any(c["id"] == f"steuer-{year}" and c["count"] == 1 for c in api.collections_list()["data"])
+    assert api.search("Zusammenfassung")["data"]["hits"]  # Kurzbeschreibung ist durchsuchbar
+    # zweiter Lauf prüft nichts doppelt
+    api.inspect_start()
+    assert wait_for(lambda: api.inspector.status()["phase"] == "done", timeout=30)
+    assert api.inspector.status()["found_tax"] == 0
+    api.shutdown()
+
+
+def test_inventory_check_pause_and_resume_after_restart(env, monkeypatch):
+    lib = env["lib"]
+    for i in range(12):
+        text_pdf(lib / "Finanzen" / f"Brief {i}.pdf", [f"Brief Nummer {i}", "Allgemeines Schreiben ohne Frist"])
+    api = make_api(env)
+    orig = api.ai.chat_json
+
+    def slow(*a, **k):
+        time.sleep(0.3)
+        return orig(*a, **k)
+    monkeypatch.setattr(api.ai, "chat_json", slow)
+    api.inspect_start()
+    assert wait_for(lambda: api.inspector.status()["done"] >= 3, timeout=30)
+    api.inspect_pause()
+    done = api.inspector.status()["done"]
+    assert api.inspector.status()["phase"] == "paused" and done < 13
+    api.inspect_start()  # fortsetzen
+    time.sleep(0.8)
+    api.shutdown()  # Programm wird mitten drin beendet
+    api2 = make_api(env)
+    assert wait_for(lambda: api2.inspector.status()["phase"] == "done", timeout=60)
+    assert api2.inspector.status()["done"] == 13
+    assert len(api2.docmeta.all()) == 13
+    api2.shutdown()
+
+
+def test_refine_big_folder_moves_with_undo(env):
+    lib = env["lib"]
+    arbeit = lib / "Arbeit"
+    arbeit.mkdir()
+    for i in range(14):
+        text_pdf(arbeit / f"2025-{i % 12 + 1:02d} Entgeltnachweis {i}.pdf", ["Firma Muster GmbH", f"Entgeltnachweis Monat {i}"])
+    for i in range(12):
+        text_pdf(arbeit / f"Arbeitsvertrag Zusatz {i}.pdf", ["Firma Muster GmbH", f"Arbeitsvertrag Änderung {i}"])
+    text_pdf(arbeit / "Kantine.pdf", ["Speiseplan der Kantine"])
+    api = make_api(env)
+    cands = api.refine_candidates()["data"]["folders"]
+    assert cands[0]["folder"] == "Arbeit" and cands[0]["count"] == 27
+    assert api.refine_start("Arbeit")["ok"]
+    assert wait_for(lambda: api.refiner.status()["phase"] == "review", timeout=60), api.refiner.status()
+    prop = api.refine_proposal()["data"]
+    subs = {s["name"]: s for s in prop["subfolders"]}
+    assert set(subs) == {"Entgeltnachweise", "Verträge"}
+    assert len(subs["Entgeltnachweise"]["docs"]) == 14 and [d["name"] for d in prop["stay"]] == ["Kantine.pdf"]
+    one_contract = subs["Verträge"]["docs"][0]["i"]
+    r = api.refine_apply([{"name": "Verträge", "new_name": "Vertrag & Zusätze"}, {"name": "Entgeltnachweise", "new_name": "Entgeltnachweise"}],
+                         {str(one_contract): ""})
+    assert r["ok"], r
+    assert wait_for(lambda: api.refiner.status()["phase"] == "done", timeout=60)
+    assert api.refiner.status()["moved"] == 25
+    assert len(list((arbeit / "Entgeltnachweise").glob("*.pdf"))) == 14
+    assert len(list((arbeit / "Vertrag & Zusätze").glob("*.pdf"))) == 11
+    assert len(list(arbeit.glob("*.pdf"))) == 2
+    # Lernen: ein neuer Entgeltnachweis landet im Unterordner
+    m = api.memory.similar("Firma Muster GmbH Entgeltnachweis Monat 99")[0]
+    assert m["folder"] == "Arbeit/Entgeltnachweise"
+    grp = [g for g in api.history_view()["data"]["reorgs"] if g["kind"] == "feinschliff"][0]
+    assert grp["count"] == 25 and grp["folder"] == "Arbeit"
+    u = api.undo_reorg(grp["id"])["data"]
+    assert u["ok"] == 25 and u["failed"] == 0
+    assert len(list(arbeit.glob("*.pdf"))) == 27 and not (arbeit / "Entgeltnachweise").exists()
+    api.shutdown()

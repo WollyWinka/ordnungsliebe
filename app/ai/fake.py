@@ -66,7 +66,31 @@ class FakeAI:
             return self._taxonomy(user)
         if name == "stapel":
             return self._split(user)
+        if name == "pruefung":
+            doc = user.lower()
+            ex = _extras(user, doc, schema)
+            return {"summary": "Test-Zusammenfassung", "doc_date": "", **ex}
+        if name == "unterteilen":
+            return self._refine(user)
+        if name == "zuordnen":
+            return self._assign(user, schema)
         return {}
+
+    def _refine(self, user: str) -> dict:
+        subs = []
+        for word, desc in (("entgelt", "Entgeltnachweise"), ("vertrag", "Verträge"), ("bescheinigung", "Bescheinigungen")):
+            if word in user.lower():
+                subs.append({"name": desc, "description": desc})
+        return {"subfolders": subs or [{"name": "Sonstiges", "description": "Rest"}]}
+
+    def _assign(self, user: str, schema: dict) -> dict:
+        names = [n for n in schema["properties"]["assign"]["items"]["properties"]["folder"]["enum"] if n]
+        out = []
+        for m in re.finditer(r"^(\d+)\. (.*)$", user, re.M):
+            line = m.group(2).lower()
+            pick = next((n for n in names if n.lower()[:5] in line), "")
+            out.append({"nr": int(m.group(1)), "folder": pick})
+        return {"assign": out}
 
     def _doc_part(self, user: str) -> str:
         i = user.rfind("Dokument (Typ")

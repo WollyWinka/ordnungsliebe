@@ -99,3 +99,76 @@ SPLIT_SCHEMA = {
     "properties": {"starts": {"type": "array", "items": {"type": "integer"}}},
     "required": ["starts"],
 }
+
+
+# --- Bestand nachträglich prüfen (Steuer, Fristen, Person) --------------------------------
+
+INSPECT_SYSTEM = """Du liest ein bereits abgelegtes privates Dokument eines Haushalts in Deutschland und hältst nur ein paar Angaben fest. Du verschiebst nichts.
+
+- "summary": ein kurzer Satz, was das Dokument ist (z. B. "Lohnsteuerbescheinigung 2025 von Firma X").
+- "doc_date": Datum des Dokuments als JJJJ-MM-TT (Rechnungs-, Brief- oder Ausstellungsdatum), sonst "".
+- "deadlines": echte Fristen und Termine, bis zu denen der Nutzer etwas tun muss (Zahlung, Kündigung, Widerspruch, Rückmeldung, Abgabe, Termin). Je Eintrag "date" (JJJJ-MM-TT) und "what" (kurz). Relative Fristen vom Dokumentdatum aus ausrechnen. Nicht das Briefdatum. Höchstens 3; sonst [].
+- "steuer": true, wenn das Dokument für die Einkommensteuererklärung nützlich sein kann (Lohnsteuerbescheinigung, Steuerbescheid, Spendenquittung, Handwerker- oder Nebenkostenabrechnung, Arzt- und Zahnarztrechnungen, Versicherungsbeiträge, Kinderbetreuung, Fortbildung, Arbeitsmittel, Riester/Rürup), sonst false.
+Antworte nur mit dem JSON-Objekt."""
+
+
+def inspect_schema(persons: list[str] | None = None) -> dict:
+    schema = {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "doc_date": {"type": "string"},
+            "deadlines": {"type": "array", "maxItems": 3,
+                          "items": {"type": "object",
+                                    "properties": {"date": {"type": "string"}, "what": {"type": "string"}},
+                                    "required": ["date", "what"]}},
+            "steuer": {"type": "boolean"},
+        },
+        "required": ["summary", "doc_date", "deadlines", "steuer"],
+    }
+    if persons:
+        schema["properties"]["person"] = {"type": "string", "enum": list(persons) + [""]}
+        schema["required"].append("person")
+    return schema
+
+
+# --- Große Ordner unterteilen („Feinschliff“) ---------------------------------------------
+
+REFINE_SYSTEM = """Ein Ordner in der privaten Ablage eines Haushalts ist zu voll geworden. Schlage eine sinnvolle Unterteilung in Unterordner vor.
+
+Regeln:
+- 2 bis 8 Unterordner, jeweils mit mindestens 3 Dokumenten. Kurze, verständliche deutsche Namen ohne Schrägstrich (z. B. "Entgeltnachweise", "Arbeitsvertrag", "Kfz", "Zahnarzt", oder Jahre wie "2024", wenn das am besten trennt).
+- Teile nach Art, Vertrag, Anbieter oder Person – so, wie man später etwas sucht. Jahreszahlen nur, wenn die Dokumente sehr gleichartig sind.
+- Wiederhole nicht den Namen des Ordners selbst.
+- "description": ein kurzer Satz, was hineingehört.
+Antworte nur mit dem JSON-Objekt."""
+
+REFINE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "subfolders": {
+            "type": "array", "minItems": 1, "maxItems": 8,
+            "items": {"type": "object",
+                      "properties": {"name": {"type": "string"}, "description": {"type": "string"}},
+                      "required": ["name", "description"]},
+        },
+    },
+    "required": ["subfolders"],
+}
+
+ASSIGN_SYSTEM = """Ordne jedes Dokument einem der Unterordner zu. Passt keiner wirklich, wähle "" – dann bleibt das Dokument, wo es ist.
+Antworte nur mit dem JSON-Objekt: für jede Nummer genau ein Eintrag."""
+
+
+def assign_schema(names: list[str], count: int) -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "assign": {"type": "array", "minItems": count, "maxItems": count,
+                       "items": {"type": "object",
+                                 "properties": {"nr": {"type": "integer"},
+                                                "folder": {"type": "string", "enum": list(names) + [""]}},
+                                 "required": ["nr", "folder"]}},
+        },
+        "required": ["assign"],
+    }

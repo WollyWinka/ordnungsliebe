@@ -116,6 +116,9 @@ class Api:
         self.models = setup.ModelManager(self.settings_store, bus)
         from .core.updater import Updater
         self.updater = Updater(self.settings_store, bus)
+        from .core.inventory import Inspector, Refiner
+        self.inspector = Inspector(self)
+        self.refiner = Refiner(self)
         self.scanfinder = setup.ScanFinder(bus)
         self._started = False
 
@@ -146,6 +149,47 @@ class Api:
         if s.setup_done and (spec is None or spec.installed or os.environ.get("ORDNUNGSLIEBE_FAKE_AI")):
             threading.Thread(target=self._warmup, daemon=True).start()
         self.index_library_async()
+        try:
+            self.inspector.resume_if_active()
+            self.refiner.resume_after_restart()
+        except Exception:
+            log.exception("Hintergrundprüfung konnte nicht fortgesetzt werden")
+
+    # --- Kontext für Bestandsprüfung und Feinschliff ---------------------------------------
+    @property
+    def bus(self):
+        return bus
+
+    def settings(self):
+        return self.settings_store.get()
+
+    def library_root(self) -> Path | None:
+        lib = self.settings_store.get().library_dir
+        return Path(lib) if lib and Path(lib).is_dir() else None
+
+    def busy(self) -> bool:
+        return self.pipeline.busy() or self.reorganizer.state.get("phase") in reorg.RUNNING
+
+    def reorg_active(self) -> bool:
+        return self.reorganizer.state.get("phase") in reorg.ACTIVE
+
+    def on_inspected(self, p: Path, sha: str, text: str) -> None:
+        root = self.library_root()
+        if root:
+            self.search_index.put(p, root=root, sha=sha, text=text, extra=self._meta_extra(sha))
+
+    def on_moved(self, src: Path, dst: Path, sha: str, text: str, folder: str, entry_id: str) -> None:
+        self.dup.move(src, dst)
+        self.docmeta.moved(str(src), str(dst))
+        self.search_index.remove(str(src))
+        root = self.library_root()
+        if root:
+            from .docs import reader as _r
+            full = _r.cached_text(sha) if sha else None
+            self.search_index.put(dst, root=root, sha=sha, text=full if full is not None else text,
+                                  extra=self._meta_extra(sha))
+        if text:  # künftige Dokumente dieser Art landen gleich im neuen Unterordner
+            self.memory.add(text, folder, dst.name, ref=entry_id, original_name=src.name)
 
     def _purge_originals(self, days: int) -> int:
         """Original-Scans werden 30 Tage aufbewahrt (für „Rückgängig“), danach gilt die aufbereitete Fassung."""
@@ -291,6 +335,11 @@ class Api:
 
     def shutdown(self) -> None:
         self._stopping.set()
+        for bg in (self.inspector, self.refiner):
+            try:
+                bg._stop.set()
+            except Exception:
+                pass
         self.pipeline.stop()
         self.scanfinder.stop()
         self.ai.shutdown()
@@ -692,6 +741,44 @@ class Api:
         path = export.export_zip(name, docs, target_dir) if fmt == "zip" else export.export_pdf(name, docs, target_dir)
         return {"path": str(path), "name": path.name, "folder": setup.pretty_path(str(path.parent))}
 
+    # --- Bestandsprüfung (D) und Feinschliff (E) ------------------------------------------
+    @api_method
+    def inspect_status(self):
+        return self.inspector.status()
+
+    @api_method
+    def inspect_start(self):
+        return self.inspector.start()
+
+    @api_method
+    def inspect_pause(self):
+        return self.inspector.pause()
+
+    @api_method
+    def refine_candidates(self):
+        return {"folders": self.refiner.candidates(), "status": self.refiner.status(),
+                "reorg_active": self.reorg_active()}
+
+    @api_method
+    def refine_start(self, folder: str):
+        return self.refiner.start(folder)
+
+    @api_method
+    def refine_status(self):
+        return self.refiner.status()
+
+    @api_method
+    def refine_proposal(self):
+        return self.refiner.proposal()
+
+    @api_method
+    def refine_apply(self, subfolders: list, moves: dict):
+        return self.refiner.apply(subfolders, moves)
+
+    @api_method
+    def refine_cancel(self):
+        return self.refiner.cancel()
+
     # --- Fristen ----------------------------------------------------------------------
     @api_method
     def deadlines(self, include_done: bool = False):
@@ -861,6 +948,7 @@ class Api:
                 continue
             entries = self.history.group_entries(g["id"])
             groups.append({"id": g["id"], "label": _day_label(g["ts"]), "count": len(entries),
+                           "kind": g.get("kind", "reorg"), "folder": naming.display_folder(g.get("folder", "")),
                            "undone": g.get("undone", False), "cancelled": g.get("cancelled", False),
                            "undo_failed": g.get("undo_failed", 0),
                            "folders": len({e.get("folder") for e in entries}),

@@ -108,11 +108,61 @@ function go(route, params) {
 
 function render() {
   const fn = SCREENS[S.route] || SCREENS.home;
+  if (!S.soft) S.lastHTML = null;
   S.actions = {};
   fn();
 }
 
-function setHTML(html) { $app.innerHTML = html; }
+// Neu zeichnen: Bei Meldungen aus dem Hintergrund (S.soft) wird der vorhandene Bildschirm nur
+// angepasst statt ersetzt – kein Flackern, Eingaben, Fokus und Bildlauf bleiben erhalten.
+function setHTML(html) {
+  const same = S.soft && S.lastRoute === S.route && $app.firstElementChild;
+  S.lastRoute = S.route;
+  if (!same) { $app.innerHTML = html; S.lastHTML = html; return; }
+  if (html === S.lastHTML) return;
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  morphChildren($app, tpl.content);
+  S.lastHTML = html;
+}
+
+function morphChildren(from, to) {
+  const a = [...from.childNodes];
+  const b = [...to.childNodes];
+  for (let i = 0; i < b.length; i++) {
+    const n = b[i], o = a[i];
+    if (!o) { from.appendChild(n); continue; }
+    if (o.nodeType !== n.nodeType || o.nodeName !== n.nodeName || (o.nodeType === 1 && (o.id || "") !== (n.id || ""))) {
+      from.replaceChild(n, o); continue;
+    }
+    if (o.nodeType !== 1) { if (o.nodeValue !== n.nodeValue) o.nodeValue = n.nodeValue; continue; }
+    morphElement(o, n);
+  }
+  for (let i = a.length - 1; i >= b.length; i--) from.removeChild(a[i]);
+}
+
+function morphElement(o, n) {
+  const tag = o.nodeName;
+  const valueChanged = o.getAttribute("value") !== n.getAttribute("value");
+  for (const at of [...o.attributes]) if (!n.hasAttribute(at.name)) o.removeAttribute(at.name);
+  for (const at of [...n.attributes]) if (o.getAttribute(at.name) !== at.value) o.setAttribute(at.name, at.value);
+  if (tag === "INPUT") {
+    if (o.type === "checkbox" || o.type === "radio") o.checked = n.hasAttribute("checked");
+    else if (valueChanged && o !== document.activeElement) o.value = n.getAttribute("value") || "";
+    return;
+  }
+  if (tag === "TEXTAREA") {
+    if (o.defaultValue !== n.defaultValue && o !== document.activeElement) o.value = n.defaultValue;
+    return;
+  }
+  morphChildren(o, n);
+}
+
+// Für Meldungen aus dem Hintergrund: gleicher Bildschirm wird sanft aktualisiert.
+function softRender() {
+  S.soft = true;
+  try { render(); } finally { S.soft = false; }
+}
 
 function applyLook() {
   const s = S.state && S.state.settings;
@@ -341,6 +391,20 @@ function updateDialog() {
 /* ===================== Ereignisse vom Programm ===================== */
 
 const HANDLERS = {
+  inspect(st) {
+    const was = S.inspect && S.inspect.phase;
+    S.inspect = st;
+    if (S.route !== "collections") return;
+    if (st.phase === "done" && was && was !== "done") render();  // neue Steuer-Mappen anzeigen
+    else redrawInspect();
+  },
+  refine(st) {
+    if (!S.refine) return;
+    const prev = S.refine.status && S.refine.status.phase;
+    S.refine.status = st;
+    if (st.phase === "review" && prev !== "review") S.refine.prop = null;
+    if (S.route === "refine") { if (prev === st.phase) softRender(); else render(); }
+  },
   search(st) {
     if (S.route === "search" && S.search) { S.search.status = { ...(S.search.status || {}), ...st, indexed: st.done }; const el = document.getElementById("search-status"); if (el) el.textContent = searchStatusText(S.search.status); }
   },
@@ -348,7 +412,7 @@ const HANDLERS = {
   queue(payload) {
     if (!S.state) return;
     S.state.queue = payload;
-    if (S.route === "home") render();
+    if (S.route === "home") softRender();
     else if (S.route === "single") singleOnQueue();
     else if (S.route === "reorg" && S.state.reorg && S.state.reorg.phase === "review") refreshReorg();
   },
@@ -360,20 +424,19 @@ const HANDLERS = {
   ai(p) {
     if (!S.state) return;
     S.state.ai = p;
-    if (S.route === "home") render();
+    if (S.route === "home") softRender();
   },
   reorg(p) {
     if (!S.state) return;
     S.state.reorg = p;
-    if (S.route === "reorg") render();
-    else if (S.route === "home") render();
+    if (S.route === "reorg" || S.route === "home") softRender();
   },
   reorg_item_done() { /* über queue abgedeckt */ },
   update(p) {
     if (!S.state) return;
     S.state.update = p;
     updateDialogRefresh();
-    if (S.route === "home") render();
+    if (S.route === "home") softRender();
   },
   scanfinder(p) {
     S.setup.finder = p;
@@ -493,7 +556,7 @@ SCREENS.home = () => {
     homeSearch: () => go("search", { q: (document.getElementById("home-q").value || "").trim() }),
     ...dueActions(),
   };
-  loadDeadlines();
+  if (!S.soft) loadDeadlines();
 };
 
 /* ---------- Suche ---------- */
@@ -630,6 +693,7 @@ async function addToCollectionDialog(path) {
 }
 
 SCREENS.collections = () => {
+  call("inspect_status").then((st) => { S.inspect = st; redrawInspect(); }).catch(() => {});
   setHTML(`<div class="screen">${topbar("Zur Startseite", "back", "Mappen")}
     <main class="wrap narrow"><div class="waiting"><div class="spinner"></div></div></main></div>`);
   S.actions = { back: () => go("home") };
@@ -647,6 +711,7 @@ function drawCollections(list) {
     <main class="wrap narrow">
       <div class="stack g10"><h1 class="title">Mappen</h1>
       <p class="lead">Eine Mappe sammelt Dokumente für einen Zweck – zum Beispiel die Steuererklärung. Die Dokumente bleiben dabei in ihren Ordnern; die Mappe merkt sich nur, wo sie liegen.</p></div>
+      <div id="inspect-card">${inspectCardHTML()}</div>
       <section class="stack g10"><h2 class="h2">Für die Steuer</h2>
         ${tax.length ? `<ul class="plainlist">${tax.map(card).join("")}</ul>` : `<div class="card"><span class="muted">Sobald ich beim Einsortieren Dokumente erkenne, die für die Steuer wichtig sind (Lohnsteuerbescheinigung, Spendenquittung, Handwerkerrechnung …), sammle ich sie hier nach Jahren.</span></div>`}
       </section>
@@ -658,6 +723,7 @@ function drawCollections(list) {
     </main></div>`);
   S.actions = {
     back: () => go("home"),
+    ...inspectActions(),
     openCol: (el) => go("collection", { id: el.dataset.id }),
     create: async () => {
       const name = (document.getElementById("new-col").value || "").trim();
@@ -737,6 +803,146 @@ function drawCollection(c) {
   };
 }
 
+/* ---------- Bestand prüfen (Steuer, Fristen) ---------- */
+function inspectCardHTML() {
+  const st = S.inspect;
+  if (!st) return "";
+  const pct = st.total ? Math.round((st.done / st.total) * 100) : 0;
+  const found = (st.found_tax || st.found_deadlines)
+    ? `Bisher gefunden: ${plural(st.found_tax, "Steuer-Dokument", "Steuer-Dokumente")}, ${plural(st.found_deadlines, "Frist", "Fristen")}.` : "";
+  const cloud = st.cloud_only ? `<span class="tiny muted">${plural(st.cloud_only, "Datei liegt", "Dateien liegen")} nur in der Cloud – die lasse ich aus.</span>` : "";
+  const head = `<div class="row g12"><div class="icon-box">${I.search(24)}</div><div class="stack g4 grow"><b style="font-size:1.1875rem">Bestehende Ablage durchsehen</b>`;
+  if (st.phase === "counting" || (st.active && st.phase === "running")) {
+    return `<section class="card stack g12">${head}<span class="small muted">${st.phase === "counting" ? "Ich zähle deine Dokumente …" : `${st.done} von ${st.total} angesehen${st.left ? ` · noch etwa ${durationText(st.minutes)}` : ""}`}</span></div></div>
+      <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div style="width:${pct}%"></div></div>
+      <span class="small">${found || "Ich arbeite nur, wenn gerade nichts anderes zu tun ist. Verschoben wird nichts."}</span>${cloud}
+      <button type="button" class="btn small" style="align-self:flex-start" data-act="inspectPause">Pause</button></section>`;
+  }
+  if (st.phase === "paused") {
+    return `<section class="card stack g12">${head}<span class="small muted">Pausiert bei ${st.done} von ${st.total}. ${found}</span></div></div>
+      <button type="button" class="btn violet small" style="align-self:flex-start" data-act="inspectStart">Weitermachen</button></section>`;
+  }
+  if (st.phase === "done") {
+    return `<section class="card stack g12">${head}<span class="small muted">Fertig – ${plural(st.total, "Dokument", "Dokumente")} angesehen. ${(st.found_tax || st.found_deadlines) ? `Neu gefunden: ${plural(st.found_tax, "Steuer-Dokument", "Steuer-Dokumente")}, ${plural(st.found_deadlines, "offene Frist", "offene Fristen")}.` : "Dabei ist nichts Neues aufgetaucht."}</span></div></div>
+      ${cloud}<button type="button" class="btn small" style="align-self:flex-start" data-act="inspectStart">Neue Dokumente durchsehen</button></section>`;
+  }
+  const err = st.phase === "error" ? `<div class="notice warn">${I.warn()}<div>${esc(st.error)}</div></div>` : "";
+  return `<section class="card stack g12">${head}<span class="small muted">Ich lese deine schon abgelegten Dokumente und suche Steuer-Dokumente und offene Fristen heraus. Ich verschiebe und ändere dabei nichts. Das läuft nebenbei und kann bei vielen Dokumenten einige Stunden dauern – du kannst jederzeit pausieren.</span></div></div>
+    ${err}<button type="button" class="btn violet" style="align-self:flex-start" data-act="inspectStart">${st.phase === "error" ? "Nochmal versuchen" : "Jetzt durchsehen"}</button></section>`;
+}
+
+function redrawInspect() {
+  const box = document.getElementById("inspect-card");
+  if (!box) return;
+  const html = inspectCardHTML();
+  if (box.dataset.html !== html) { box.innerHTML = html; box.dataset.html = html; }
+}
+
+function inspectActions() {
+  return {
+    inspectStart: async (el) => { el.disabled = true; const st = await tryCall("inspect_start"); if (st) { S.inspect = st; redrawInspect(); } else el.disabled = false; },
+    inspectPause: async (el) => { el.disabled = true; const st = await tryCall("inspect_pause"); if (st) { S.inspect = st; redrawInspect(); } },
+  };
+}
+
+/* ---------- Feinschliff: volle Ordner unterteilen ---------- */
+SCREENS.refine = () => {
+  if (!S.refine || !S.soft) S.refine = { off: new Set(), names: {}, open: new Set(), ...(S.refine || {}) };
+  const st = S.refine.status;
+  if (!st) {
+    setHTML(`<div class="screen">${topbar("Zurück", "back", "Feinschliff")}<main class="wrap narrow"><div class="waiting"><div class="spinner"></div></div></main></div>`);
+    S.actions = { back: () => go(S.params.from || "home") };
+    call("refine_candidates").then((r) => { S.refine.status = r.status; S.refine.cands = r.folders; S.refine.reorgActive = r.reorg_active; if (S.route === "refine") render(); }).catch((e) => toast(e.message));
+    return;
+  }
+  if (st.phase === "review" && !S.refine.prop) {
+    call("refine_proposal").then((p) => { S.refine.prop = p; if (S.route === "refine") render(); }).catch((e) => toast(e.message));
+  }
+  drawRefine();
+};
+
+function drawRefine() {
+  const R = S.refine;
+  const st = R.status;
+  const wrap = (title, body) => setHTML(`<div class="screen">${topbar("Zurück", "back", "Feinschliff")}
+    <main class="wrap narrow"><div class="stack g10"><h1 class="title">${title}</h1></div>${body}</main></div>`);
+  const actions = {
+    back: () => { S.refine = null; go(S.params.from || "home"); },
+    pick: async (el) => { el.disabled = true; const r = await tryCall("refine_start", el.dataset.folder); if (r) { R.status = r; R.prop = null; R.off = new Set(); R.names = {}; R.open = new Set(); render(); } else el.disabled = false; },
+    cancel: async () => { const r = await tryCall("refine_cancel"); if (r) { R.status = r; R.prop = null; R.status = null; render(); } },
+    undo: async (el) => {
+      const ok = await confirmDialog("Feinschliff rückgängig machen?", "Alle Dokumente kommen zurück in den ursprünglichen Ordner. Leere neue Unterordner werden entfernt.", "Rückgängig machen");
+      if (!ok) return;
+      el.disabled = true;
+      const r = await tryCall("undo_reorg", st.group);
+      if (r) { toast(r.failed ? `${r.ok} zurückgelegt, ${r.failed} nicht (inzwischen verändert).` : "Alles wieder wie vorher."); R.status = null; await tryCall("refine_cancel"); render(); }
+    },
+    again: async () => { await tryCall("refine_cancel"); S.refine = null; render(); },
+  };
+  S.actions = actions;
+  const pct = st.total ? Math.round((st.done / st.total) * 100) : 0;
+  if (["reading", "thinking", "moving"].includes(st.phase)) {
+    const label = { reading: `Ich lese die Dokumente in „${esc(st.display)}“`, thinking: "Ich überlege mir passende Unterordner", moving: "Ich verschiebe die Dokumente" }[st.phase];
+    wrap(label, `<section class="card big stack g16"><div class="row g12"><div class="spinner small"></div><span class="muted">${st.done} von ${st.total}</span></div>
+      <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div style="width:${pct}%"></div></div>
+      ${st.phase === "moving" ? "" : `<span class="small muted">Verschoben wird erst, wenn du den Vorschlag bestätigt hast.</span>`}</section>
+      ${st.phase === "moving" ? "" : `<button type="button" class="btn link" style="align-self:flex-start" data-act="cancel">Abbrechen</button>`}`);
+    return;
+  }
+  if (st.phase === "done") {
+    wrap("Fertig!", `<section class="card stack g12"><span class="lead" style="margin:0">${plural(st.moved, "Dokument", "Dokumente")} in Unterordner von „${esc(st.display)}“ verschoben${st.failed ? ` · ${st.failed} konnte ich nicht verschieben (inzwischen verändert oder nicht mehr da)` : ""}.</span>
+      <span class="muted">Neue Dokumente dieser Art lege ich ab jetzt gleich in die passenden Unterordner. Im Verlauf kannst du alles rückgängig machen.</span></section>
+      <div class="row g12 wrapflex"><button type="button" class="btn primary" data-act="again">Weiteren Ordner unterteilen</button>
+      ${st.group ? `<button type="button" class="btn" data-act="undo">Rückgängig machen</button>` : ""}</div>`);
+    return;
+  }
+  if (st.phase === "review") {
+    const P = R.prop;
+    if (!P) { wrap("Mein Vorschlag", `<div class="waiting"><div class="spinner"></div></div>`); return; }
+    const docRow = (d) => `<li><label><input type="checkbox" data-change="toggleDoc" data-i="${d.i}" ${R.off.has(d.i) ? "" : "checked"}>
+      <span style="overflow-wrap:anywhere">${esc(d.name)}</span></label></li>`;
+    const subs = P.subfolders.map((sub, si) => {
+      const n = sub.docs.filter((d) => !R.off.has(d.i)).length;
+      const isOpen = R.open.has(si);
+      return `<section class="card stack g10">
+        <div class="row g10 wrapflex">${I.folder(22)}<span class="muted">${esc(P.display)} ›</span>
+          <input class="text" style="flex:1 1 12rem;max-width:22rem" data-input="rename" data-name="${esc(sub.name)}" value="${esc(R.names[sub.name] ?? sub.name)}" aria-label="Name des Unterordners" maxlength="50"></div>
+        <span class="small muted">${esc(sub.description)}</span>
+        <button type="button" class="btn link small" style="align-self:flex-start" data-act="openSub" data-si="${si}" aria-expanded="${isOpen}">${n === sub.docs.length ? plural(n, "Dokument", "Dokumente") : `${n} von ${sub.docs.length} Dokumenten`} ${I.chev()}</button>
+        ${isOpen ? `<ul class="refine-docs">${sub.docs.map(docRow).join("")}</ul>` : ""}</section>`;
+    }).join("");
+    const total = P.subfolders.reduce((a, sub) => a + sub.docs.filter((d) => !R.off.has(d.i)).length, 0);
+    wrap(`Vorschlag für „${esc(P.display)}“`, `<p class="lead">So würde ich den Ordner unterteilen. Du kannst die Namen ändern und einzelne Dokumente abwählen – die bleiben dann, wo sie sind. Ein leerer Name heißt: diesen Unterordner nicht anlegen.</p>
+      <div class="stack g12">${subs}</div>
+      ${P.stay.length ? `<div class="card stack g8"><b>Bleibt direkt in „${esc(P.display)}“</b><span class="small muted">${P.stay.map((d) => esc(d.name)).slice(0, 12).join(" · ")}${P.stay.length > 12 ? ` · und ${P.stay.length - 12} weitere` : ""}</span></div>` : ""}
+      ${P.cloud_only ? `<p class="tiny muted">${plural(P.cloud_only, "Datei liegt", "Dateien liegen")} nur in der Cloud und bleibt, wo sie ist.</p>` : ""}
+      <div class="footbar"><button type="button" class="btn link" data-act="cancel">Verwerfen</button>
+        <button type="button" class="btn primary tall" data-act="apply" ${total ? "" : "disabled"}>${I.check()} ${plural(total, "Dokument", "Dokumente")} verschieben</button></div>`);
+    Object.assign(S.actions, {
+      toggleDoc: (el) => { const i = +el.dataset.i; if (el.checked) R.off.delete(i); else R.off.add(i); drawRefine(); },
+      openSub: (el) => { const si = +el.dataset.si; if (R.open.has(si)) R.open.delete(si); else R.open.add(si); drawRefine(); },
+      rename: (el) => { R.names[el.dataset.name] = el.value; },
+      apply: async (el) => {
+        el.disabled = true;
+        const subsArg = P.subfolders.map((sub) => ({ name: sub.name, new_name: (R.names[sub.name] ?? sub.name).trim() }));
+        const moves = {};
+        R.off.forEach((i) => { moves[i] = ""; });
+        const r = await tryCall("refine_apply", subsArg, moves);
+        if (r) { R.status = r; R.prop = null; render(); } else el.disabled = false;
+      },
+    });
+    return;
+  }
+  // Auswahl eines Ordners
+  const err = st.phase === "error" ? `<div class="notice warn">${I.warn()}<div>${esc(st.error)}</div></div>` : "";
+  const list = (R.cands || []).map((c) => `<li><div class="choice" style="cursor:default"><div class="icon-box s">${I.folder(22)}</div>
+    <div class="stack g4 grow"><span style="font-size:1.125rem;font-weight:600;overflow-wrap:anywhere">${esc(c.display)}</span><span class="small muted">${plural(c.count, "Dokument", "Dokumente")} direkt darin</span></div>
+    <button type="button" class="btn violet small" data-act="pick" data-folder="${esc(c.folder)}" ${R.reorgActive ? "disabled" : ""}>Unterteilen</button></div></li>`).join("");
+  wrap("Volle Ordner unterteilen", `<p class="lead">Wenn sich in einem Ordner viele Dokumente sammeln, schlage ich passende Unterordner vor. Du prüfst den Vorschlag – erst dann verschiebe ich etwas, und alles lässt sich rückgängig machen.</p>
+    ${err}${R.reorgActive ? `<div class="notice info">${I.info ? I.info() : ""}<div>Gerade läuft eine Neuordnung. Schließe sie erst ab.</div></div>` : ""}
+    ${list ? `<ul class="plainlist">${list}</ul>` : `<div class="card"><span class="muted">Kein Ordner ist so voll, dass sich eine Unterteilung lohnt (ab 25 Dokumenten). Prima!</span></div>`}`);
+}
+
 /* ---------- Fristen („Demnächst fällig“) ---------- */
 const MONTHS_SHORT = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"];
 const MONTHS_LONG = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"];
@@ -760,7 +966,9 @@ function loadDeadlines() {
   call("deadlines").then((list) => {
     S.deadlines = list;
     const box = document.getElementById("due-box");
-    if (box && S.route === "home") box.innerHTML = dueBoxHTML();
+    const html = dueBoxHTML();
+    if (box && S.route === "home" && S.dueHTML !== html) box.innerHTML = html;
+    S.dueHTML = html;
   }).catch(() => {});
 }
 
@@ -1327,13 +1535,13 @@ function drawHistory(h) {
       ${e.undone ? `<span class="row g8" style="color:var(--ok);font-weight:600">${I.check(20)} ${e.action === "ignore" ? "Wird wieder vorgeschlagen" : "Zurückgelegt"}</span>`
         : e.undoable ? `<button type="button" class="btn small violet" data-act="undo" data-id="${esc(e.id)}">${I.undo()} ${e.action === "trash" ? "Zurückholen" : e.action === "ignore" ? "Doch vorschlagen" : "Rückgängig"}</button>` : ""}
     </li>`).join("")}</ul></div>`).join("");
-  const reorgs = h.reorgs.map((g) => `<div class="stack g10"><h2 class="h2">${esc(g.label)} · Ablage neu geordnet${g.cancelled ? " (abgebrochen)" : ""}</h2>
+  const reorgs = h.reorgs.map((g) => `<div class="stack g10"><h2 class="h2">${esc(g.label)} · ${g.kind === "feinschliff" ? `„${esc(g.folder)}“ unterteilt` : "Ablage neu geordnet"}${g.cancelled ? " (abgebrochen)" : ""}</h2>
     <div class="card row g20 wrapflex"><div class="icon-box">${I.layers(26)}</div>
       <div class="stack g4 grow" style="flex-basis:20rem"><span style="font-size:1.1875rem;font-weight:600">${plural(g.count, "Dokument", "Dokumente")} neu einsortiert</span>
       <span class="tiny muted">${g.undone ? "Diese Neuordnung wurde rückgängig gemacht."
         : g.undo_failed ? `${plural(g.undo_failed, "Dokument wurde", "Dokumente wurden")} inzwischen verändert oder verschoben und blieben, wo sie sind. Du kannst es noch einmal versuchen.`
         : "Die alte Ordnung lässt sich jederzeit komplett wiederherstellen."}</span></div>
-      ${g.undone ? "" : `<button type="button" class="btn small danger" data-act="undoReorg" data-id="${esc(g.id)}">Gesamte Neuordnung rückgängig machen</button>`}
+      ${g.undone ? "" : `<button type="button" class="btn small danger" data-act="undoReorg" data-id="${esc(g.id)}">${g.kind === "feinschliff" ? "Unterteilung rückgängig machen" : "Gesamte Neuordnung rückgängig machen"}</button>`}
     </div></div>`).join("");
   const empty = !h.days.length && !h.reorgs.length;
   setHTML(`<div class="screen">${topbar("Zur Startseite", "back", "Verlauf")}
@@ -1829,7 +2037,7 @@ function loadLibInfo() {
 
 /* ---------- Neuordnung ---------- */
 function refreshReorg() {
-  call("reorg_status").then((r) => { S.state.reorg = r; if (S.route === "reorg") render(); }).catch(() => {});
+  call("reorg_status").then((r) => { S.state.reorg = r; if (S.route === "reorg") softRender(); }).catch(() => {});
 }
 
 SCREENS.reorg = () => {
@@ -1872,10 +2080,14 @@ function drawReorgIntro(r) {
         <div class="actions" style="border:none;padding:0"><span class="muted small" style="align-self:center">Das Einlesen dauert je nach Menge eine Weile – du kannst nebenbei weiterarbeiten.</span>
           <button type="button" class="btn primary tall shadow" data-act="start" ${li && li.count ? "" : "disabled"}>Neuordnung starten ${I.right()}</button></div>
         ${li && li.ok && !li.count ? `<p class="muted">In deiner Ablage liegen noch keine Dokumente – hier gibt es nichts aufzuräumen.</p>` : ""}
+        <button type="button" class="choice" data-act="refine"><div class="icon-box">${I.folder(24)}</div>
+          <div class="stack g4 grow"><span style="font-size:1.1875rem;font-weight:600">Nur volle Ordner unterteilen</span>
+          <span class="muted">Feinschliff: Ich schlage für Ordner mit vielen Dokumenten passende Unterordner vor – ohne die ganze Ablage neu zu ordnen.</span></div>${I.right()}</button>
       </main></div>`);
     S.actions = {
       back: () => go("home"),
       mode: (el) => { S.reorgMode = el.dataset.id; drawReorgIntro(r); },
+      refine: () => { S.refine = null; go("refine", { from: "reorg" }); },
       changeLib: async () => {
         const f = await browseFolder(S.state.settings.library_dir, "Welcher Ordner soll neu geordnet werden?", false);
         if (!f) return;

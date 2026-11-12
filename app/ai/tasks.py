@@ -277,3 +277,76 @@ def detect_starts(ai, page_texts: list[str]) -> list[int]:
     if 1 not in starts:
         starts.insert(0, 1)
     return starts
+
+
+def inspect(ai, *, text: str, name: str, persons: list[str] | None = None) -> dict:
+    """Bestand nachträglich prüfen: Kurzbeschreibung, Datum, Fristen, Steuer, Person."""
+    persons = [p for p in (persons or []) if p]
+    parts = []
+    if persons:
+        parts.append(prompts.PERSON_RULE.format(names=", ".join(f'"{p}"' for p in persons)))
+    parts.append(f"Heute ist der {_dt.date.today().isoformat()}.")
+    parts.append(f"Dateiname: {name}\n\nDokument (Text, gekürzt):\n{(text or '')[:5000]}")
+    raw = ai.chat_json(prompts.INSPECT_SYSTEM, "\n\n".join(parts), prompts.inspect_schema(persons),
+                       "pruefung", max_tokens=400)
+    doc_date = str(raw.get("doc_date") or "")
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", doc_date)
+    person = str(raw.get("person") or "").strip().lower()
+    return {
+        "summary": re.sub(r"\s+", " ", str(raw.get("summary") or "")).strip()[:160],
+        "doc_date": doc_date if m else "",
+        "deadlines": clean_deadlines(raw.get("deadlines")),
+        "steuer": bool(raw.get("steuer")),
+        "person": next((p for p in persons if p.lower() == person), ""),
+    }
+
+
+def _clean_sub(name: str) -> str:
+    return naming.clean_part(str(name or "").replace("/", " ").replace("\\", " ").strip(), "")[:50]
+
+
+def refine_folder(ai, *, folder: str, docs: list[dict], on_progress=None, should_stop=None) -> dict:
+    """docs: [{"name", "text"}] → {"subfolders": [{"name","description"}], "assign": [name|"" je Dokument]}."""
+    lines = [f"{i + 1}. [{d['name']}] {re.sub(r'\s+', ' ', d.get('text') or '')[:200]}" for i, d in enumerate(docs)]
+    sample = _batches(lines, budget=11000)[0]
+    raw = ai.chat_json(prompts.REFINE_SYSTEM,
+                       f"Ordner: {naming.display_folder(folder)}\nDokumente ({len(docs)} insgesamt"
+                       f"{', Auswahl' if len(sample) < len(lines) else ''}):\n" + "\n".join(sample),
+                       prompts.REFINE_SCHEMA, "unterteilen", max_tokens=700)
+    last = folder.split("/")[-1].lower()
+    subs, seen = [], set()
+    for s in raw.get("subfolders") or []:
+        name = _clean_sub(s.get("name"))
+        if not name or name.lower() in seen or name.lower() == last:
+            continue
+        seen.add(name.lower())
+        subs.append({"name": name, "description": str(s.get("description") or "")[:140]})
+    subs = subs[:8]
+    if not subs:
+        return {"subfolders": [], "assign": [""] * len(docs)}
+    names = [s["name"] for s in subs]
+    assign = [""] * len(docs)
+    chunk = 25
+    for start in range(0, len(docs), chunk):
+        if should_stop and should_stop():
+            break
+        part = lines[start:start + chunk]
+        user = ("Unterordner:\n" + "\n".join(f"- {s['name']}: {s['description']}" for s in subs)
+                + "\n\nDokumente:\n" + "\n".join(part))
+        raw = ai.chat_json(prompts.ASSIGN_SYSTEM, user, prompts.assign_schema(names, len(part)), "zuordnen",
+                           max_tokens=60 + 25 * len(part))
+        for a in raw.get("assign") or []:
+            try:
+                idx = int(a.get("nr")) - 1
+            except (TypeError, ValueError):
+                continue
+            if start <= idx < start + len(part) and a.get("folder") in names:
+                assign[idx] = a["folder"]
+        if on_progress:
+            on_progress(min(len(docs), start + chunk), len(docs))
+    # Unterordner mit weniger als 2 Dokumenten lohnen nicht
+    counts = {n: assign.count(n) for n in names}
+    keep = {n for n, c in counts.items() if c >= 2}
+    assign = [a if a in keep else "" for a in assign]
+    subs = [s for s in subs if s["name"] in keep]
+    return {"subfolders": subs, "assign": assign}
