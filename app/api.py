@@ -99,8 +99,10 @@ class Api:
         from .store.hints import Hints, Ignored
         self.hints = Hints()
         self.ignored = Ignored()
+        from .store.docmeta import DocMeta
+        self.docmeta = DocMeta()
         self.pipeline = Pipeline(self.settings_store, self.ai, self.memory, self.history, self.dup,
-                                 self.schemes, bus, hints=self.hints, ignored=self.ignored)
+                                 self.schemes, bus, hints=self.hints, ignored=self.ignored, docmeta=self.docmeta)
         self.reorganizer = reorg.Reorganizer(self.settings_store, self.ai, self.pipeline, self.history,
                                              self.schemes, self.dup, self.backups, bus)
         self.models = setup.ModelManager(self.settings_store, bus)
@@ -194,8 +196,19 @@ class Api:
 
     @api_method
     def save_settings(self, changes: dict):
-        allowed = {"font_size", "theme", "batch_level", "inbox_dir", "library_dir", "keep_cloud_local", "auto_update"}
-        changes = changes or {}
+        allowed = {"font_size", "theme", "batch_level", "inbox_dir", "library_dir", "keep_cloud_local", "auto_update",
+                   "persons", "person_mode"}
+        changes = dict(changes or {})
+        if "persons" in changes:
+            names, seen = [], set()
+            for n in changes["persons"] or []:
+                n = naming.clean_part(str(n), "")[:40]
+                if n and n.lower() not in seen:
+                    seen.add(n.lower())
+                    names.append(n)
+            changes["persons"] = names[:12]
+        if "person_mode" in changes and changes["person_mode"] not in ("dateiname", "unterordner", "merken"):
+            raise ValueError("Unbekannte Einstellung.")
         if "inbox_dir" in changes or "library_dir" in changes:
             cur = self.settings_store.get()
             inbox = Path(changes.get("inbox_dir", cur.inbox_dir))
@@ -402,8 +415,69 @@ class Api:
         return self.pipeline.thumbs(item_id)
 
     @api_method
-    def confirm(self, item_id: str, folder: str = None, filename: str = None):
-        return self.pipeline.confirm(item_id, folder, filename)
+    def confirm(self, item_id: str, folder: str = None, filename: str = None, extra: dict = None):
+        return self.pipeline.confirm(item_id, folder, filename, extra)
+
+    @api_method
+    def set_person(self, item_id: str, person: str, folder: str, filename: str):
+        """Person im Vorschlag ändern: Ordner/Dateinamen passend zur Einstellung umbauen."""
+        st = self.settings_store.get()
+        folder, filename = naming.apply_person(folder, filename, person, st.persons or [], st.person_mode)
+        return {"folder": folder, "folder_display": naming.display_folder(folder), "filename": filename,
+                "person": person}
+
+    # --- Fristen ----------------------------------------------------------------------
+    @api_method
+    def deadlines(self, include_done: bool = False):
+        return self.docmeta.deadlines(include_done=include_done)
+
+    @api_method
+    def deadline_done(self, dl_id: str, done: bool = True):
+        if not self.docmeta.set_done(dl_id, done):
+            raise KeyError("Diese Frist gibt es nicht mehr.")
+        return True
+
+    @api_method
+    def deadline_ics(self, ids: list[str]):
+        """Legt eine Kalenderdatei an und öffnet sie – Windows fragt dann, in welchen Kalender."""
+        from .store.docmeta import make_ics
+        items = [d for d in (self.docmeta.deadline(i) for i in ids or []) if d]
+        if not items:
+            raise ValueError("Keine Frist ausgewählt.")
+        target = paths.cache_dir() / "kalender" / (f"Frist {items[0]['date']}.ics" if len(items) == 1 else "Fristen.ics")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(make_ics(items), encoding="utf-8", newline="")
+        self._open(target)
+        return str(target)
+
+    def _open(self, p: Path) -> None:
+        if os.environ.get("ORDNUNGSLIEBE_NO_OPEN"):
+            return
+        if paths.IS_WINDOWS:
+            os.startfile(str(p))  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["xdg-open", str(p)])
+
+    @api_method
+    def open_file(self, path: str):
+        p = Path(path)
+        if not p.is_file():
+            raise FileNotFoundError("Die Datei ist nicht mehr da – vielleicht wurde sie verschoben.")
+        self._open(p)
+        return True
+
+    @api_method
+    def show_in_folder(self, path: str):
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError("Die Datei ist nicht mehr da – vielleicht wurde sie verschoben.")
+        if os.environ.get("ORDNUNGSLIEBE_NO_OPEN"):
+            return True
+        if paths.IS_WINDOWS:
+            subprocess.Popen(["explorer", "/select,", str(p)])
+        else:
+            subprocess.Popen(["xdg-open", str(p.parent)])
+        return True
 
     @api_method
     def reject(self, item_id: str):

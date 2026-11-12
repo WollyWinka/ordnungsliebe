@@ -27,6 +27,21 @@ KEYWORDS = [
 _DATE = re.compile(r"\b(\d{1,2})\.(\d{1,2})\.(20\d{2}|19\d{2})\b")
 
 
+_DUE = re.compile(r"(?:zahlbar bis|fällig am|bis zum|spätestens am|frist[^0-9]{0,20})\s*(\d{1,2})\.(\d{1,2})\.(20\d{2})")
+_STEUER = ["lohnsteuer", "spende", "handwerker", "nebenkosten", "steuer", "arzt", "zahnarzt"]
+
+
+def _extras(user: str, doc: str, schema: dict) -> dict:
+    out = {"deadlines": [], "steuer": any(w in doc for w in _STEUER)}
+    for m in _DUE.finditer(doc):
+        out["deadlines"].append({"date": f"{m.group(3)}-{int(m.group(2)):02d}-{int(m.group(1)):02d}",
+                                 "what": "Frist aus dem Dokument"})
+    persons = schema["properties"].get("person", {}).get("enum")
+    if persons:
+        out["person"] = next((p for p in persons if p and p.lower() in doc), "")
+    return out
+
+
 class FakeAI:
     def __init__(self, on_status=None):
         self.on_status = on_status or (lambda *a: None)
@@ -46,7 +61,7 @@ class FakeAI:
         self.warmup()
         time.sleep(0.15)
         if name == "einordnung":
-            return self._classify(user, schema)
+            return {**self._classify(user, schema), **_extras(user, self._doc_part(user), schema)}
         if name == "struktur":
             return self._taxonomy(user)
         if name == "stapel":

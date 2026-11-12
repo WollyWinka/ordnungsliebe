@@ -33,8 +33,11 @@ def _trash(path: Path) -> Path:
 
 
 class Pipeline:
-    def __init__(self, settings_store, ai, memory, history, dupindex, schemes, bus, hints=None, ignored=None):
+    def __init__(self, settings_store, ai, memory, history, dupindex, schemes, bus, hints=None, ignored=None,
+                 docmeta=None):
+        from ..store.docmeta import DocMeta
         from ..store.hints import Hints, Ignored
+        self.docmeta = docmeta or DocMeta()
         self.hints = hints or Hints()
         self.ignored = ignored or Ignored()
         self.settings_store = settings_store
@@ -294,13 +297,22 @@ class Pipeline:
             folders, allow_new, below = list(self.reorg_folders), True, True
         else:
             folders, allow_new, below = library.list_folders(self.library_root), True, False
+        st = self.settings
+        persons = [p for p in (st.persons or []) if p]
+        if persons and st.person_mode == "unterordner":
+            # Personen-Unterordner setzt das Programm selbst – die KI wählt den Sachordner
+            names = {p.lower() for p in persons}
+            folders = [f for f in folders if f.split("/")[-1].lower() not in names]
         suggestion = tasks.classify(
             self.ai, text=item["text"], original=Path(item["src"]), kind=item["kind"],
             page_count=item["page_count"], folders=folders,
             folder_info=self._folder_info(folders, with_files=item["origin"] == "inbox"),
             examples=self.memory.similar(item["text"]), excluded=item["excluded"], allow_new=allow_new,
             user_hints=self.hints.relevant(item["text"]), doc_hint=item.get("hint", ""),
-            folder_counts=self.folder_counts(item["origin"]), new_only_below=below)
+            folder_counts=self.folder_counts(item["origin"]), new_only_below=below, persons=persons)
+        if persons:
+            suggestion["folder"], suggestion["filename"] = naming.apply_person(
+                suggestion["folder"], suggestion["filename"], suggestion.get("person", ""), persons, st.person_mode)
         suggestion["folder_display"] = naming.display_folder(suggestion["folder"])
         suggestion["alt_display"] = naming.display_folder(suggestion["alt_folder"])
         item.update(stage="doc", suggestion=suggestion, status="ready")
@@ -342,6 +354,7 @@ class Pipeline:
             with self._lock:
                 self.items.pop(item["id"], None)
             self.memory.add(item.get("text", ""), current, src.name, ref="", original_name=src.name)
+            self._record_meta(item, src, current, s)
 
     # --- Abfragen für die Oberfläche ---------------------------------------------
     def _public(self, item: dict, with_text: bool = False) -> dict:
@@ -412,9 +425,16 @@ class Pipeline:
             item["status"] = "moving"
             return item
 
-    def confirm(self, item_id: str, folder: str | None = None, filename: str | None = None) -> dict:
+    def confirm(self, item_id: str, folder: str | None = None, filename: str | None = None,
+                extra: dict | None = None) -> dict:
         item = self._claim(item_id)
         try:
+            if extra and item.get("suggestion"):
+                s = item["suggestion"]
+                if isinstance(extra.get("deadlines"), list):
+                    s["deadlines"] = tasks.clean_deadlines(extra["deadlines"])
+                if "person" in extra:
+                    s["person"] = str(extra.get("person") or "")
             result = self._do_confirm(item, folder, filename)
         except Exception:
             with self._lock:
@@ -498,9 +518,15 @@ class Pipeline:
                 self.dup.save()
             except OSError:
                 pass
-        mem = self.memory.add(item.get("text", ""), folder, dst.name, ref=entry["id"], original_name=src.name,
-                              ai_folder=s.get("folder", ""), ai_reason=s.get("reason", ""),
+        persons = self.settings.persons or []
+        mem_folder, mem_name = naming.strip_person(folder, dst.name, persons)
+        ai_folder = naming.strip_person(s.get("folder", ""), "", persons)[0] if s.get("folder") else ""
+        if self.settings.person_mode != "unterordner":  # Personen-Ordner hat dann der Nutzer selbst angelegt
+            mem_folder, ai_folder = folder, s.get("folder", "")
+        mem = self.memory.add(item.get("text", ""), mem_folder, mem_name, ref=entry["id"], original_name=src.name,
+                              ai_folder=ai_folder, ai_reason=s.get("reason", ""),
                               hint=item.get("hint", ""))
+        self._record_meta(item, dst, folder, s, sha=entry.get("info", {}).get("dst_sha") or "", entry_id=entry["id"])
         self.history.update(entry["id"], info={**entry.get("info", {}), "ai_folder": s.get("folder", ""),
                                                "reason": s.get("reason", ""), "corrected": mem["corrected"]})
         if s and s.get("is_new_folder") and s.get("folder") == folder:
@@ -511,6 +537,17 @@ class Pipeline:
                                              keep_if_folder=folder)
         return {"dst": str(dst), "folder_display": naming.display_folder(folder), "name": dst.name,
                 "rechecked": rechecked}
+
+    def _record_meta(self, item: dict, path: Path, folder: str, s: dict, sha: str = "", entry_id: str = "") -> None:
+        try:
+            sha = sha or item.get("sha") or reader.file_hash(path)
+            self.docmeta.record(sha, str(path), folder=folder, summary=s.get("summary", ""),
+                                doc_date=s.get("doc_date", ""), deadlines=s.get("deadlines") or [],
+                                person=s.get("person", ""), steuer=bool(s.get("steuer")), entry_id=entry_id)
+            if s.get("deadlines"):
+                self.bus.emit("deadlines", {})
+        except Exception:
+            log.exception("Dokumentdaten konnten nicht gespeichert werden")
 
     def recheck_similar(self, text: str, exclude: str = "", origin: str | None = None,
                         keep_if_folder: str = "", min_score: float = 0.3) -> int:

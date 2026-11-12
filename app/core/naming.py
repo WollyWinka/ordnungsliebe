@@ -71,3 +71,41 @@ def folder_to_path(root: Path, folder: str) -> Path:
 
 def display_folder(folder: str) -> str:
     return " › ".join(p for p in folder.split("/") if p)
+
+
+# --- Personen im Haushalt ----------------------------------------------------------
+
+PERSON_SEP = " – "
+
+
+def _split_suffix(filename: str) -> tuple[str, str]:
+    m = re.match(r"^(.*?)(\.[A-Za-z0-9]{1,5})?$", filename or "")
+    return (m.group(1) or ""), (m.group(2) or "")
+
+
+def strip_person(folder: str, filename: str, persons: list[str]) -> tuple[str, str]:
+    """Entfernt einen Personennamen aus Ordner (letzte Ebene) und Dateiname (Endung „ – Name“)."""
+    names = {p.strip().lower() for p in persons if p and p.strip()}
+    parts = [p for p in (folder or "").split("/") if p]
+    if len(parts) > 1 and parts[-1].lower() in names:
+        parts = parts[:-1]
+    stem, suffix = _split_suffix(filename)
+    for name in names:
+        tail = PERSON_SEP.lower() + name
+        if stem.lower().endswith(tail):
+            stem = stem[: -len(tail)].rstrip()
+            break
+    return "/".join(parts), stem + suffix
+
+
+def apply_person(folder: str, filename: str, person: str, persons: list[str], mode: str) -> tuple[str, str]:
+    """Setzt die Person je nach Einstellung in den Dateinamen oder als Unterordner (vorher alte entfernen)."""
+    folder, filename = strip_person(folder, filename, persons)
+    person = clean_part(person or "", "")
+    if not person or mode == "merken":
+        return folder, filename
+    parts = [p for p in folder.split("/") if p]
+    if mode == "unterordner" and parts and len(parts) < 3:
+        return "/".join(parts + [person]), filename
+    stem, suffix = _split_suffix(filename)
+    return folder, f"{stem}{PERSON_SEP}{person}{suffix}"

@@ -543,3 +543,76 @@ def test_updater_detects_downloads_and_verifies(env, monkeypatch):
     r = api.update_install()  # Testumgebung ist keine installierte Windows-Version
     assert not r["ok"]
     api.shutdown()
+
+
+def _one_item(api):
+    assert wait_for(lambda: api.pipeline.overview()["total"] == 1 and api.pipeline.overview()["working"] == 0)
+    items = api.batch("inbox")["data"] or [api.next_single("inbox")["data"]]
+    return items[0]
+
+
+def test_deadlines_detected_listed_done_and_calendar_file(env, monkeypatch):
+    import datetime as dt
+    monkeypatch.setenv("ORDNUNGSLIEBE_NO_OPEN", "1")
+    api = make_api(env)
+    due = dt.date.today() + dt.timedelta(days=10)
+    text_pdf(env["inbox"] / "rechnung.pdf", ["Stadtwerke Bamberg", "Stromabrechnung vom 02.11.2026",
+                                             f"Der Betrag ist zahlbar bis {due.strftime('%d.%m.%Y')}."])
+    item = _one_item(api)
+    s = item["suggestion"]
+    assert s["deadlines"] == [{"date": due.isoformat(), "what": "Frist aus dem Dokument"}]
+    # Nutzer ändert den Text der Frist in der Prüfung
+    res = api.confirm(item["id"], None, None, {"deadlines": [{"date": due.isoformat(), "what": "Strom bezahlen"}]})
+    assert res["ok"], res
+    dl = api.deadlines()["data"]
+    assert len(dl) == 1 and dl[0]["what"] == "Strom bezahlen" and dl[0]["days"] == 10
+    assert dl[0]["path"] == res["data"]["dst"]
+
+    path = Path(api.deadline_ics([dl[0]["id"]])["data"])
+    ics = path.read_bytes().decode("utf-8")
+    assert "BEGIN:VEVENT" in ics and f"DTSTART;VALUE=DATE:{due.strftime('%Y%m%d')}" in ics
+    assert "SUMMARY:Strom bezahlen" in ics and "TRIGGER:-P2D" in ics
+    assert all(len(line.encode()) <= 75 for line in ics.split("\r\n"))
+
+    assert api.deadline_done(dl[0]["id"])["ok"]
+    assert api.deadlines()["data"] == []
+    assert len(api.deadlines(True)["data"]) == 1
+    # Datei wird zurückgenommen → Frist verschwindet
+    api.deadline_done(dl[0]["id"], False)
+    entry = api.history_view()["data"]["days"][0]["entries"][0]
+    assert api.undo(entry["id"])["ok"]
+    assert api.deadlines()["data"] == []
+    api.shutdown()
+
+
+def test_person_in_filename_and_subfolder(env):
+    api = make_api(env)
+    assert api.save_settings({"persons": ["Erika", " erika ", "Karl", ""]})["data"]["persons"] == ["Erika", "Karl"]
+    text_pdf(env["inbox"] / "auszug.pdf", ["Sparkasse Bamberg", "Kontoauszug Nr. 11 vom 03.11.2026 für Erika Muster",
+                                           "Girokonto Kontostand", "Kontoauszug"])
+    item = _one_item(api)
+    s = item["suggestion"]
+    assert s["person"] == "Erika"
+    assert s["folder"] == "Finanzen/Bank" and s["filename"] == "2026-11 Kontoauszug – Erika.pdf"
+    # Nutzer stellt auf Karl um
+    r = api.set_person(item["id"], "Karl", s["folder"], s["filename"])["data"]
+    assert r["filename"] == "2026-11 Kontoauszug – Karl.pdf"
+    res = api.confirm(item["id"], r["folder"], r["filename"], {"person": "Karl"})["data"]
+    assert Path(res["dst"]).name == "2026-11 Kontoauszug – Karl.pdf"
+    # Gedächtnis lernt den Dateinamen ohne Person, das ist keine Korrektur
+    m = api.memory.similar("Kontoauszug Girokonto Sparkasse")[0]
+    assert m["filename"] == "2026-11 Kontoauszug.pdf" and not m["corrected"]
+    meta = api.docmeta.find_path(res["dst"])[1]
+    assert meta["person"] == "Karl"
+
+    api.save_settings({"person_mode": "unterordner"})
+    text_pdf(env["inbox"] / "auszug2.pdf", ["Sparkasse Bamberg", "Kontoauszug Nr. 12 vom 01.12.2026 für Erika",
+                                            "Girokonto Kontostand", "Kontoauszug"])
+    item = _one_item(api)
+    s = item["suggestion"]
+    assert s["folder"] == "Finanzen/Bank/Erika" and s["filename"] == "2026-12 Kontoauszug.pdf"
+    res = api.confirm(item["id"])["data"]
+    assert Path(res["dst"]).parent == env["lib"] / "Finanzen" / "Bank" / "Erika"
+    mems = [e for e in api.memory.entries if e["filename"].startswith("2026-12")]
+    assert mems and mems[0]["folder"] == "Finanzen/Bank" and not mems[0]["corrected"]
+    api.shutdown()

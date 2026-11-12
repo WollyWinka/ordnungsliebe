@@ -83,9 +83,23 @@ def main():
             page.wait_for_timeout(800)
             shot("06-start-leer")
 
+            # Personen im Haushalt
+            page.evaluate("go('settings')")
+            page.wait_for_timeout(800)
+            for name in ("Erika", "Karl"):
+                page.fill("#person-new", name)
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(500)
+            page.locator("#person-new").scroll_into_view_if_needed()
+            shot("06b-einstellungen-personen")
+            page.evaluate("go('home')")
             # Dokumente in den Scan-Ordner legen
+            import datetime as dt
+            due = (dt.date.today() + dt.timedelta(days=5)).strftime("%d.%m.%Y")
             scan_pdf(inbox / "Scan_0047.pdf", [["Nordstern Versicherung AG", "Ihre Hausratversicherung",
                                                  "Beitragsrechnung 2027 vom 03.11.2026", "Hausrat Beitrag 2027"]])
+            text_pdf(inbox / "mahnung.pdf", ["Praxis Dr. Muster", "Rechnung an Erika Muster vom 01.11.2026",
+                                             f"Bitte zahlbar bis {due}", "Arztrechnung"])
             text_pdf(inbox / "auszug.pdf", ["Sparkasse Bamberg", "Kontoauszug Nr. 11 vom 03.11.2026",
                                             "Girokonto Kontostand", "Kontoauszug"])
             text_pdf(inbox / "unklar.pdf", ["Sehr geehrte Damen und Herren", "anbei die Unterlagen vom 05.10.2026"])
@@ -98,7 +112,7 @@ def main():
             # Bestand für Doppelte indizieren
             for _ in range(80):
                 st = post("overview", "inbox")["data"]
-                if st["total"] >= 6 and st["working"] == 0:
+                if st["total"] >= 7 and st["working"] == 0:
                     break
                 time.sleep(0.5)
             page.wait_for_timeout(1500)
@@ -114,11 +128,13 @@ def main():
             page.keyboard.press("Enter")
             page.wait_for_timeout(2000)
             shot("09-einzelpruefung")
-            for i in range(8):
+            for i in range(10):
                 stage = page.evaluate("S.cur && S.cur.item ? S.cur.item.stage + '|' + S.cur.item.kind : 'none'")
                 shot(f"10-einzeln-{i}-{stage.replace('|', '-')}")
                 if stage == "none":
                     break
+                if page.locator(".due-note").count():
+                    shot(f"10-einzeln-{i}-frist")
                 if stage.startswith("stack"):
                     page.click("text=So trennen")
                 elif stage.startswith("duplicate"):
@@ -137,6 +153,9 @@ def main():
                     else:
                         page.click("text=Passt so – einsortieren")
                 page.wait_for_timeout(2500)
+            page.evaluate("go('home')")
+            page.wait_for_timeout(1200)
+            shot("10z-start-fristen")
             page.evaluate("go('history')")
             page.wait_for_timeout(1000)
             shot("11-verlauf")

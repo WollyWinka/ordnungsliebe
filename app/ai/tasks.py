@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as _dt
 import logging
 import re
 from pathlib import Path
@@ -33,7 +34,8 @@ def classify(ai, *, text: str, original: Path, kind: str, page_count: int,
              folders: list[str], folder_info: dict[str, dict], examples: list[dict],
              excluded: list[str] | None = None, allow_new: bool = True,
              user_hints: list[str] | None = None, doc_hint: str = "",
-             folder_counts: dict[str, int] | None = None, new_only_below: bool = False) -> dict:
+             folder_counts: dict[str, int] | None = None, new_only_below: bool = False,
+             persons: list[str] | None = None) -> dict:
     """Schlägt Ordner, Dateinamen und Kurzbeschreibung vor.
 
     folder_info: Ordner -> {"scheme": str, "files": [Beispieldateinamen]}
@@ -83,20 +85,56 @@ def classify(ai, *, text: str, original: Path, kind: str, page_count: int,
         user.append('Wähle unbedingt einen vorhandenen Ordner, nicht "__NEU__".')
     elif new_only_below:
         user.append('Neue Ordner ("__NEU__") nur als Unterordner eines vorhandenen Ordners aus der Liste.')
+    persons = [p for p in (persons or []) if p]
+    if persons:
+        user.append(prompts.PERSON_RULE.format(names=", ".join(f'"{p}"' for p in persons)))
+    user.append(f"Heute ist der {_dt.date.today().isoformat()}.")
     type_label = {"pdf": "PDF", "image": "Bild/Scan", "office": "Office-Datei", "email": "E-Mail"}.get(kind, kind)
     user.append(f"Dokument (Typ: {type_label}, Originalname: {original.name}, Seiten: {page_count}):\n"
                 f"«{_doc_excerpt(text) or '(kein Text erkennbar)'}»")
 
-    schema = prompts.classify_schema(allowed if allowed or not allow_new else [])
+    schema = prompts.classify_schema(allowed if allowed or not allow_new else [], persons)
     if not allow_new and not allowed:
         allowed = folders[:]  # Notfall: alles erlaubt
-        schema = prompts.classify_schema(allowed)
+        schema = prompts.classify_schema(allowed, persons)
     if not allow_new:
         schema["properties"]["folder"]["enum"] = allowed or [prompts.NEW_FOLDER]
 
-    raw = ai.chat_json(prompts.CLASSIFY_SYSTEM, "\n\n".join(user), schema, "einordnung", max_tokens=400)
-    return _postprocess(raw, original=original, kind=kind, folders=folders, excluded=excluded,
-                        allow_new=allow_new, examples=examples, new_only_below=new_only_below)
+    raw = ai.chat_json(prompts.CLASSIFY_SYSTEM, "\n\n".join(user), schema, "einordnung", max_tokens=650)
+    out = _postprocess(raw, original=original, kind=kind, folders=folders, excluded=excluded,
+                       allow_new=allow_new, examples=examples, new_only_below=new_only_below)
+    out["deadlines"] = clean_deadlines(raw.get("deadlines"))
+    out["steuer"] = bool(raw.get("steuer"))
+    person = str(raw.get("person") or "")
+    out["person"] = next((p for p in persons if p.lower() == person.strip().lower()), "")
+    return out
+
+
+def clean_deadlines(raw) -> list[dict]:
+    """Nur gültige Daten (JJJJ-MM-TT), plausibler Zeitraum, höchstens drei, ohne Doppelte."""
+    out, seen = [], set()
+    today = _dt.date.today()
+    for d in raw if isinstance(raw, list) else []:
+        if not isinstance(d, dict):
+            continue
+        m = re.match(r"^\s*(\d{4})-(\d{1,2})-(\d{1,2})", str(d.get("date") or ""))
+        if not m:
+            continue
+        try:
+            day = _dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            continue
+        if not (today.year - 3 <= day.year <= today.year + 10):
+            continue
+        what = re.sub(r"\s+", " ", str(d.get("what") or "")).strip()[:90] or "Frist"
+        key = (day, what.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"date": day.isoformat(), "what": what})
+        if len(out) == 3:
+            break
+    return out
 
 
 def _postprocess(raw: dict, *, original: Path, kind: str, folders: list[str], excluded: list[str],

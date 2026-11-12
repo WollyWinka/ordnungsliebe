@@ -78,6 +78,11 @@ document.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape" && $modal.innerHTML) { closeModal(null); return; }
   if ($modal.innerHTML || ev.ctrlKey || ev.altKey || ev.metaKey || ev.repeat) return;
   const t = ev.target;
+  if (ev.key === "Enter" && t && t.dataset && t.dataset.enter) {
+    const b = document.querySelector(`[data-act="${t.dataset.enter}"]`);
+    if (b) { ev.preventDefault(); b.click(); }
+    return;
+  }
   if (t && (t.closest("input, textarea, select, [contenteditable]") || (t.closest("button, a") && (ev.key === "Enter" || ev.key === " ")))) return;
   const map = SHORTCUTS[S.route];
   const name = map && (map[ev.key] || map[ev.key.toLowerCase()]);
@@ -147,6 +152,8 @@ const I = {
   scissors: (s = 26) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M20 4L8.12 15.88M14.47 14.48L20 20M8.12 8.12L12 12"/></svg>`,
   trash: (s = 22) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/></svg>`,
   equal: (s = 26) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 9h14M5 15h14"/></svg>`,
+  cal: (s = 24) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 10h17M8 3v4M16 3v4"/></svg>`,
+  user: (s = 24) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4.5 20.5c1.2-3.8 4-5.5 7.5-5.5s6.3 1.7 7.5 5.5"/></svg>`,
   warn: (s = 24) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l9.5 17h-19z"/><path d="M12 10v4M12 17.5v.5"/></svg>`,
 };
 
@@ -334,6 +341,7 @@ function updateDialog() {
 /* ===================== Ereignisse vom Programm ===================== */
 
 const HANDLERS = {
+  deadlines() { if (S.route === "home") loadDeadlines(); },
   queue(payload) {
     if (!S.state) return;
     S.state.queue = payload;
@@ -451,6 +459,7 @@ SCREENS.home = () => {
       ${updateBanner}
       ${reorgBanner}
       ${hero}
+      <div id="due-box">${dueBoxHTML()}</div>
       <div class="tiles">
         <button type="button" class="tile" data-act="reorg"><div class="icon-box">${I.layers()}</div>
           <span class="tile-title">Ablage neu ordnen</span><span class="tile-text">Bestehende Ordner aufräumen und übersichtlich sortieren.</span></button>
@@ -469,8 +478,84 @@ SCREENS.home = () => {
     update: () => updateDialog(),
     history: () => go("history"),
     settings: () => go("settings"),
+    ...dueActions(),
   };
+  loadDeadlines();
 };
+
+/* ---------- Fristen („Demnächst fällig“) ---------- */
+const MONTHS_SHORT = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"];
+const MONTHS_LONG = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"];
+
+function dateLong(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return `${d}. ${MONTHS_LONG[m - 1]} ${y}`;
+}
+
+function daysText(n) {
+  if (n === 0) return "heute";
+  if (n === 1) return "morgen";
+  if (n === -1) return "seit gestern überfällig";
+  if (n < 0) return `seit ${-n} Tagen überfällig`;
+  if (n < 14) return `in ${n} Tagen`;
+  if (n < 60) return `in ${Math.round(n / 7)} Wochen`;
+  return `in ${Math.round(n / 30)} Monaten`;
+}
+
+function loadDeadlines() {
+  call("deadlines").then((list) => {
+    S.deadlines = list;
+    const box = document.getElementById("due-box");
+    if (box && S.route === "home") box.innerHTML = dueBoxHTML();
+  }).catch(() => {});
+}
+
+function dueBoxHTML() {
+  const list = S.deadlines || [];
+  if (!list.length) return "";
+  const all = !!S.dueAll;
+  const shown = all ? list : list.slice(0, 4);
+  const rows = shown.map((d) => {
+    const [, m, day] = d.date.split("-").map(Number);
+    const cls = d.days < 0 ? "over" : d.days <= 7 ? "soon" : "";
+    return `<li class="due-row">
+      <div class="due-date ${cls}" aria-hidden="true"><b>${day}</b><span>${MONTHS_SHORT[m - 1]}</span></div>
+      <div class="stack g4 grow" style="flex-basis:14rem;min-width:0">
+        <span class="due-what">${esc(d.what)}</span>
+        <span class="small muted"><span class="${cls ? "due-" + cls : ""}">${esc(daysText(d.days))}</span> · ${esc(dateLong(d.date))}${d.person ? " · " + esc(d.person) : ""}</span>
+        <button type="button" class="textbtn small" style="align-self:flex-start;overflow-wrap:anywhere;text-align:left" data-act="dueOpen" data-path="${esc(d.path)}">${I.doc(16)} ${esc(d.name)}</button>
+      </div>
+      <div class="row g8 wrapflex due-btns">
+        <button type="button" class="btn small" data-act="dueCal" data-id="${esc(d.id)}">${I.cal(18)} In den Kalender</button>
+        <button type="button" class="btn small violet" data-act="dueDone" data-id="${esc(d.id)}">${I.check(18, 2.4)} Erledigt</button>
+      </div></li>`;
+  }).join("");
+  return `<section class="card stack g12 due" aria-label="Demnächst fällig">
+    <div class="row between wrapflex g12"><h2 style="font-size:1.3125rem" class="row g10">${I.cal()} Demnächst fällig</h2>
+      ${list.length > 1 ? `<button type="button" class="textbtn" data-act="dueCalAll">Alle in den Kalender</button>` : ""}</div>
+    <ul class="duelist">${rows}</ul>
+    ${list.length > 4 ? `<button type="button" class="textbtn" style="align-self:flex-start" data-act="dueMore">${all ? "Weniger anzeigen" : `Alle ${list.length} anzeigen`}</button>` : ""}
+  </section>`;
+}
+
+function dueActions() {
+  const redraw = () => { const box = document.getElementById("due-box"); if (box) box.innerHTML = dueBoxHTML(); };
+  const calNote = "Die Kalenderdatei ist geöffnet – dein Kalenderprogramm fragt, ob du den Termin übernehmen möchtest.";
+  return {
+    dueOpen: (el) => tryCall("open_file", el.dataset.path),
+    dueMore: () => { S.dueAll = !S.dueAll; redraw(); },
+    dueCal: async (el) => { if (await tryCall("deadline_ics", [el.dataset.id])) toast(calNote); },
+    dueCalAll: async () => { if (await tryCall("deadline_ics", (S.deadlines || []).map((d) => d.id))) toast(calNote); },
+    dueDone: async (el) => {
+      const id = el.dataset.id;
+      if (await tryCall("deadline_done", id, true)) {
+        S.deadlines = (S.deadlines || []).filter((d) => d.id !== id);
+        redraw();
+        toast("Als erledigt abgehakt.", { label: "Rückgängig", fn: async () => { await tryCall("deadline_done", id, false); loadDeadlines(); } });
+      }
+    },
+  };
+}
 
 async function startReview(origin) {
   const ov = await tryCall("overview", origin);
@@ -709,7 +794,9 @@ function drawSingle() {
             : `<div class="row g12 wrapflex"><div class="value grow" style="flex-basis:15rem">${esc(stem)}<span class="ext">${esc(ext)}</span></div>
                <button type="button" class="btn small violet" data-act="editName">Ändern</button></div>`}
         </div>
+        ${personRow(s)}
       </div>
+      ${deadlineNotes(s)}
       ${it.hint ? `<div class="small muted">Dein Hinweis: „${esc(it.hint)}“</div>` : ""}
       ${hintBox(c)}
       <div class="stack g12 mt-auto">
@@ -765,7 +852,7 @@ function drawSingle() {
       if (c.editName) S.actions.saveName();
       el.disabled = true;
       const s = it.suggestion;
-      const res = await tryCall("confirm", it.id, s.folder, s.filename);
+      const res = await tryCall("confirm", it.id, s.folder, s.filename, { deadlines: s.deadlines || [], person: s.person || "" });
       if (res) {
         toast(res.rechecked ? `Abgelegt in ${res.folder_display}. Ich passe ${plural(res.rechecked, "ähnlichen Vorschlag", "ähnliche Vorschläge")} an.` : `Abgelegt in ${res.folder_display}`);
         loadNextSingle();
@@ -798,6 +885,17 @@ function drawSingle() {
         drawSingle();
       } else el.disabled = false;
     },
+    person: async (el) => {
+      const s = it.suggestion;
+      if (c.editName) S.actions.saveName();
+      const r = await tryCall("set_person", it.id, el.dataset.name, s.folder, s.filename);
+      if (r) { Object.assign(s, r); drawSingle(); }
+    },
+    dlRemove: (el) => {
+      const s = it.suggestion;
+      s.deadlines = (s.deadlines || []).filter((_, i) => i !== +el.dataset.i);
+      drawSingle();
+    },
     notDoc: async () => {
       if (await tryCall("not_document", it.id)) {
         toast("Bleibt, wo es ist – ich schlage es nicht mehr vor. Im Verlauf kannst du das zurücknehmen.");
@@ -805,6 +903,25 @@ function drawSingle() {
       }
     },
   });
+}
+
+function personRow(s) {
+  const persons = (S.state.settings.persons || []);
+  if (!persons.length) return "";
+  const cur = s.person || "";
+  const chip = (name, label) => `<button type="button" class="btn chip ${cur === name ? "on" : ""}" aria-pressed="${cur === name}" data-act="person" data-name="${esc(name)}">${esc(label)}</button>`;
+  return `<hr class="hr"><div class="stack g10"><span class="label">Für wen?</span>
+    <div class="row g8 wrapflex">${persons.map((p) => chip(p, p)).join("")}${chip("", "Alle / Haushalt")}</div></div>`;
+}
+
+function deadlineNotes(s) {
+  const list = s.deadlines || [];
+  if (!list.length) return "";
+  return `<div class="notice info due-note">${I.cal()}<div class="stack g8 grow">
+    <b>${list.length === 1 ? "Ich habe eine Frist gefunden" : `Ich habe ${list.length} Fristen gefunden`}</b>
+    ${list.map((d, i) => `<div class="row g10 wrapflex"><span class="grow" style="flex-basis:12rem">${esc(dateLong(d.date))} – ${esc(d.what)}</span>
+      <button type="button" class="textbtn small" data-act="dlRemove" data-i="${i}">Stimmt nicht</button></div>`).join("")}
+    <span class="tiny muted">Ich erinnere dich auf der Startseite. In deinen Kalender kommt nur etwas, wenn du es dort möchtest.</span></div></div>`;
 }
 
 const HINT_CHIPS = [
@@ -825,7 +942,7 @@ function hintBox(c) {
         ${HINT_CHIPS.map(([l, t]) => `<button type="button" class="btn chip" data-act="hintChip" data-text="${esc(t)}">${esc(l)}</button>`).join("")}
       </div>
       <label class="sr-only" for="hint">Hinweis für die KI</label>
-      <input class="text" id="hint" data-input="hintText" value="${esc(c.hintText || "")}" placeholder="z. B. „Rechnungen von Amazon gehören zu Einkäufe“" maxlength="500">
+      <input class="text" id="hint" data-input="hintText" data-enter="hintSend" value="${esc(c.hintText || "")}" placeholder="z. B. „Rechnungen von Amazon gehören zu Einkäufe“" maxlength="500">
       <div class="row between wrapflex g12"><span class="tiny muted">Ich merke mir den Hinweis auch für ähnliche Dokumente.</span>
         <button type="button" class="btn violet" data-act="hintSend">Neuer Vorschlag mit Hinweis</button></div>
     </div>` : ""}
@@ -1063,6 +1180,17 @@ SCREENS.settings = () => {
           <button type="button" class="textbtn" style="align-self:flex-start" data-act="forget">Gelerntes vergessen und neu anfangen …</button>
         </section>
       </div>
+      <section class="card stack g16"><h2 style="font-size:1.3125rem">Personen im Haushalt</h2>
+          <span class="tiny muted">Wenn ich weiß, wer bei euch wohnt, merke ich mir bei jedem Dokument, für wen es ist.</span>
+          <div class="row g8 wrapflex">${(s.persons || []).map((p, i) => `<span class="tag person">${I.user(16)} ${esc(p)}
+            <button type="button" class="iconbtn tiny-x" data-act="personDel" data-i="${i}" aria-label="${esc(p)} entfernen">${I.x(16)}</button></span>`).join("")}
+            ${(s.persons || []).length ? "" : '<span class="small muted">Noch niemand eingetragen.</span>'}</div>
+          <div class="row g8" style="max-width:36rem"><input class="text" id="person-new" data-enter="personAdd" placeholder="Vorname, z. B. Erika" maxlength="40" aria-label="Name hinzufügen">
+            <button type="button" class="btn small violet" data-act="personAdd">${I.plus(18)} Hinzufügen</button></div>
+          ${(s.persons || []).length ? `<div class="stack g10" style="max-width:44rem"><span class="tiny muted">Wie soll man das in der Ablage sehen?</span>
+          ${seg("person_mode", [["dateiname", "Name im Dateinamen"], ["unterordner", "Eigener Unterordner"], ["merken", "Nur merken"]])}
+          <span class="tiny muted">${esc({ dateiname: "Beispiel: Finanzen › Bank › „2026-11 Kontoauszug – Erika.pdf“", unterordner: "Beispiel: Finanzen › Bank › Erika › „2026-11 Kontoauszug.pdf“", merken: "Datei- und Ordnernamen bleiben unverändert; ich merke es mir nur für die Suche." }[s.person_mode] || "")}</span></div>` : ""}
+        </section>
       <section class="card stack g16"><h2 style="font-size:1.3125rem">Programm</h2>
         <div class="row between wrapflex g12"><span>Ordnungsliebe ${esc(S.state.version)}${(S.state.update || {}).available ? ` · <b>neue Version ${esc(S.state.update.version)} verfügbar</b>` : ""}</span>
           <button type="button" class="btn small violet" data-act="checkUpdate">${(S.state.update || {}).available ? "Ansehen" : "Nach Updates suchen"}</button></div>
@@ -1092,6 +1220,16 @@ SCREENS.settings = () => {
     },
     models: () => modelDialog(),
     backups: () => backupsDialog(),
+    personAdd: async () => {
+      const f = document.getElementById("person-new");
+      const v = (f.value || "").trim();
+      if (!v) { toast("Bitte einen Namen eingeben."); f.focus(); return; }
+      if (await tryCall("save_settings", { persons: [...(s.persons || []), v] })) { await refreshState(); render(); }
+    },
+    personDel: async (el) => {
+      const list = (s.persons || []).filter((_, i) => i !== +el.dataset.i);
+      if (await tryCall("save_settings", { persons: list })) { await refreshState(); render(); }
+    },
     autoUpdate: async () => { if (await tryCall("save_settings", { auto_update: s.auto_update === false })) { await refreshState(); render(); } },
     checkUpdate: async (el) => {
       if ((S.state.update || {}).available) { updateDialog(); return; }

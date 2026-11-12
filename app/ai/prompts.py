@@ -20,12 +20,16 @@ Regeln:
 - "reason": ein bis zwei kurze deutsche Sätze, WARUM dieser Ordner passt (z. B. "Entgeltnachweis des Arbeitgebers; der Nutzer legt solche Nachweise in Arbeit/Gehalt/Entgeltnachweise ab."). Schreibe die Begründung, bevor du den Ordner wählst.
 - KORREKTUREN des Nutzers bei ähnlichen Fällen sind verbindlich: Ist das Dokument von derselben Art wie ein korrigierter Fall, wähle den Ordner aus der Korrektur – auch wenn ein übergeordneter Ordner ebenfalls passen würde. Ein spezieller Unterordner, den der Nutzer gewählt hat, schlägt immer den allgemeinen Ordner darüber.
 - UNTERORDNER: Hinter manchen Ordnern steht, wie viele Dokumente dort schon liegen. Ist der passende Ordner schon recht voll (ab etwa 20) und gehört das Dokument zu einer klar abgrenzbaren, wiederkehrenden Art (z. B. Entgeltnachweise, Kontoauszüge, Arztrechnungen, ein bestimmter Vertrag oder Anbieter), dann schlage einen neuen Unterordner DARUNTER vor ("__NEU__", z. B. new_folder "Arbeit/Gehalt/Entgeltnachweise"). Gibt es schon einen passenden Unterordner, nimm ihn statt des Oberordners. Keine Unterordner für Einzelstücke.
-- Hinweise des Nutzers haben Vorrang vor allem anderen. Ein Hinweis zu genau diesem Dokument gilt für Ordner UND Dateinamen; nennt er einen Ordner, der nicht in der Liste steht, wähle "__NEU__" und trage ihn in "new_folder" ein."""
+- Hinweise des Nutzers haben Vorrang vor allem anderen. Ein Hinweis zu genau diesem Dokument gilt für Ordner UND Dateinamen; nennt er einen Ordner, der nicht in der Liste steht, wähle "__NEU__" und trage ihn in "new_folder" ein.
+- "deadlines": echte Fristen und Termine, bis zu denen der Nutzer etwas tun muss oder die er nicht verpassen darf (Zahlung, Kündigung, Widerspruch, Rückmeldung, Abgabe, Arzt- oder Behördentermin). Je Eintrag "date" als JJJJ-MM-TT und "what" als kurze Beschreibung (z. B. "Rechnung Stadtwerke bezahlen"). Relative Fristen ("innerhalb von 14 Tagen", "bis Monatsende") vom Datum des Dokuments aus ausrechnen. NICHT das Briefdatum, keine Zeiträume von Abrechnungen, keine bereits bezahlten Beträge. Höchstens 3; gibt es keine, dann [].
+- "steuer": true, wenn das Dokument für die Einkommensteuererklärung nützlich sein kann (z. B. Lohnsteuerbescheinigung, Steuerbescheid, Spendenquittung, Handwerker- oder Nebenkostenabrechnung, Arzt- und Zahnarztrechnungen, Versicherungsbeiträge, Kinderbetreuung, Fortbildung, Arbeitsmittel, Riester/Rürup), sonst false."""
+
+PERSON_RULE = """- "person": Für wen im Haushalt ist das Dokument (Empfänger oder betroffene Person)? Genau einer dieser Namen: {names}. Leer (""), wenn es den ganzen Haushalt betrifft oder unklar ist."""
 
 
-def classify_schema(folders: list[str]) -> dict:
+def classify_schema(folders: list[str], persons: list[str] | None = None) -> dict:
     choices = list(folders) + [NEW_FOLDER]
-    return {
+    schema = {
         "type": "object",
         "properties": {
             "summary": {"type": "string"},
@@ -36,10 +40,21 @@ def classify_schema(folders: list[str]) -> dict:
             "alternative_folder": {"type": "string", "enum": list(folders) + [""]},
             "filename": {"type": "string"},
             "confidence": {"type": "string", "enum": CONFIDENCE_VALUES},
+            "deadlines": {
+                "type": "array", "maxItems": 3,
+                "items": {"type": "object",
+                          "properties": {"date": {"type": "string"}, "what": {"type": "string"}},
+                          "required": ["date", "what"]},
+            },
+            "steuer": {"type": "boolean"},
         },
         "required": ["summary", "doc_date", "reason", "folder", "new_folder", "alternative_folder",
-                     "filename", "confidence"],
+                     "filename", "confidence", "deadlines", "steuer"],
     }
+    if persons:
+        schema["properties"]["person"] = {"type": "string", "enum": list(persons) + [""]}
+        schema["required"].append("person")
+    return schema
 
 
 TAXONOMY_SYSTEM = """Du entwirfst eine übersichtliche, gut gegliederte Ordnerstruktur für die privaten Dokumente eines Haushalts in Deutschland.
