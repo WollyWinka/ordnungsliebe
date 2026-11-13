@@ -6,6 +6,7 @@ import logging
 import logging.handlers
 import os
 import sys
+from pathlib import Path
 
 
 def _setup_logging() -> None:
@@ -35,6 +36,26 @@ def _single_instance() -> bool:
     return not already
 
 
+def _free_port() -> int:
+    """Jedes Mal eine neue lokale Adresse: so kann die Anzeige nie eine alte Oberfläche aus dem
+    Zwischenspeicher zeigen (z. B. nach einem Update)."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _clear_view_cache(storage: "Path") -> None:
+    """Zwischenspeicher der Anzeige (WebView2) leeren – Einstellungen liegen ohnehin im Programm."""
+    import shutil
+    if not storage.is_dir():
+        return
+    for name in ("Cache", "Code Cache", "GPUCache", "Service Worker"):
+        for d in storage.rglob(name):
+            if d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
+
+
 def main() -> None:
     _setup_logging()
     if not _single_instance():
@@ -55,8 +76,13 @@ def main() -> None:
     window.events.loaded += api.start_background
     window.events.closed += api.shutdown
     gui = "edgechromium" if sys.platform.startswith("win") else None
+    storage = paths.local_dir() / "webview"
+    try:
+        _clear_view_cache(storage)
+    except Exception:
+        logging.getLogger(__name__).exception("Anzeige-Zwischenspeicher nicht geleert")
     webview.start(gui=gui, debug=bool(os.environ.get("ORDNUNGSLIEBE_DEBUG")), private_mode=False,
-                  storage_path=str(paths.local_dir() / "webview"))
+                  storage_path=str(storage), http_port=_free_port())
 
 
 if __name__ == "__main__":
