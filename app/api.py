@@ -76,6 +76,15 @@ def _nested(a: Path, b: Path) -> bool:
     return a == b or a.is_relative_to(b) or b.is_relative_to(a)
 
 
+def _mail_where(e: dict) -> str:
+    info = e.get("info", {})
+    n = len(info.get("parts", []))
+    what = {"attachments": "Anhang" if n == 1 else f"{n} Anhänge", "mail": "Mail als PDF",
+            "both": f"Mail als PDF und {n - 1} Anhang" if n == 2 else f"Mail als PDF und {n - 1} Anhänge"}.get(
+        info.get("choice", ""), f"{n} Dokumente")
+    return f"Mail „{info.get('subject', '')}“ → {what}"
+
+
 def _day_label(ts: float) -> str:
     d = time.localtime(ts)
     today = time.localtime()
@@ -122,6 +131,8 @@ class Api:
         self.updater = Updater(self.settings_store, bus)
         from .core.inventory import Inspector, Refiner
         self.inspector = Inspector(self)
+        from .core.mailin import MailFetcher
+        self.mailer = MailFetcher(self.settings_store, bus, self._inbox_path)
         self.refiner = Refiner(self)
         self.scanfinder = setup.ScanFinder(bus)
         self._started = False
@@ -154,6 +165,10 @@ class Api:
             threading.Thread(target=self._warmup, daemon=True).start()
         self.index_library_async()
         try:
+            self.mailer.start()
+        except Exception:
+            log.exception("Mail-Abruf konnte nicht gestartet werden")
+        try:
             self.inspector.resume_if_active()
             self.refiner.resume_after_restart()
         except Exception:
@@ -166,6 +181,10 @@ class Api:
 
     def settings(self):
         return self.settings_store.get()
+
+    def _inbox_path(self) -> Path | None:
+        d = self.settings_store.get().inbox_dir
+        return Path(d) if d and Path(d).is_dir() else None
 
     def library_root(self) -> Path | None:
         lib = self.settings_store.get().library_dir
@@ -360,6 +379,10 @@ class Api:
 
     def shutdown(self) -> None:
         self._stopping.set()
+        try:
+            self.mailer.stop()
+        except Exception:
+            pass
         try:  # laufende Neuordnung sauber pausieren, damit sie nach dem Neustart weitergeht
             self.reorganizer.pause()
             t = self.reorganizer._thread
@@ -773,6 +796,41 @@ class Api:
         path = export.export_zip(name, docs, target_dir) if fmt == "zip" else export.export_pdf(name, docs, target_dir)
         return {"path": str(path), "name": path.name, "folder": setup.pretty_path(str(path.parent))}
 
+    # --- Mails weiterleiten (F) -------------------------------------------------------------
+    @api_method
+    def mail_status(self):
+        return self.mailer.public()
+
+    @api_method
+    def mail_provider(self, address: str):
+        from .core.mailin import provider_for
+        return provider_for(address)
+
+    @api_method
+    def mail_save(self, address: str, password: str = "", senders: list = None, host: str = "", port: int = 993):
+        return self.mailer.save(address, password or None, senders or [], host, port)
+
+    @api_method
+    def mail_enable(self, enabled: bool):
+        return self.mailer.set_enabled(enabled)
+
+    @api_method
+    def mail_fetch_now(self):
+        n = self.mailer.fetch()
+        return {**self.mailer.public(), "new": n}
+
+    @api_method
+    def mail_allow_sender(self, address: str):
+        return self.mailer.allow_sender(address)
+
+    @api_method
+    def mail_forget(self):
+        return self.mailer.forget()
+
+    @api_method
+    def mail_choice(self, item_id: str, choice: str):
+        return self.pipeline.mail_choice(item_id, choice)
+
     # --- Bestandsprüfung (D) und Feinschliff (E) ------------------------------------------
     @api_method
     def inspect_status(self):
@@ -966,13 +1024,14 @@ class Api:
             where = {"ignore": "als Foto markiert – wird nicht mehr vorgeschlagen",
                      "move": "nach " + naming.display_folder(e.get("folder", "")),
                      "trash": "doppelt – zur Seite gelegt (30 Tage aufbewahrt)",
-                     "split": f"in {len(e.get('info', {}).get('parts', []))} Dokumente aufgeteilt"}
+                     "split": f"in {len(e.get('info', {}).get('parts', []))} Dokumente aufgeteilt",
+                     "mail": _mail_where(e)}
             name = e["name"] if e["action"] != "trash" else Path(e["src"]).name
             days[label].append({
                 "id": e["id"], "time": time.strftime("%H:%M", time.localtime(e["ts"])),
                 "name": name, "where": where.get(e["action"], ""), "undone": e["undone"],
                 "action": e["action"],
-                "undoable": (e["action"] in ("move", "trash") and not e["undone"] and Path(e["dst"]).exists())
+                "undoable": (e["action"] in ("move", "trash", "mail") and not e["undone"] and Path(e["dst"]).exists())
                             or (e["action"] == "ignore" and not e["undone"])})
         groups = []
         for g in sorted(self.history.groups.values(), key=lambda g: g["ts"], reverse=True):
@@ -992,6 +1051,8 @@ class Api:
         entry = self.history.get(entry_id)
         if entry is None:
             raise KeyError("Eintrag nicht gefunden.")
+        if entry["action"] == "mail":
+            return self._undo_mail(entry)
         if entry["action"] == "ignore":
             self.ignored.remove(entry.get("info", {}).get("ignore_id", ""))
             self.pipeline._ignored_inbox.discard(entry["src"])
@@ -1000,6 +1061,28 @@ class Api:
         where = reorg.undo_entry(entry, self.settings_store.get(), self.history, self.memory, self.dup,
                                  moved=self._moved_back)
         return {"where": setup.pretty_path(where)}
+
+    def _undo_mail(self, entry: dict) -> dict:
+        """Mail zurück in den Scan-Ordner; noch nicht abgelegte Teile verschwinden wieder.
+        Bereits abgelegte Teile bleiben – die lassen sich einzeln zurücknehmen."""
+        if entry.get("undone"):
+            raise ValueError("Das wurde schon rückgängig gemacht.")
+        kept, back = Path(entry["dst"]), Path(entry["src"])
+        if not kept.exists():
+            raise FileNotFoundError("Die Mail ist nicht mehr im Papierkorb (nach 30 Tagen gelöscht).")
+        left = 0
+        for part in entry.get("info", {}).get("parts", []):
+            p = Path(part)
+            if p.exists():
+                self.pipeline.forget_path(p)
+                library.quarantine(p)
+            else:
+                left += 1
+        restored = library.move_file(kept, naming.unique_path(back))
+        self.history.mark_undone(entry["id"])
+        # zurück in die Prüfung – diesmal mit der Frage „Anhang oder ganze Mail?“
+        self.pipeline.add_file(restored, origin="inbox", mail_ask=True)
+        return {"where": setup.pretty_path(str(restored)), "left": left}
 
     @api_method
     def undo_reorg(self, group_id: str):

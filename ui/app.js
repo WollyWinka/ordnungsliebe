@@ -100,6 +100,7 @@ const SHORTCUTS = {
 };
 
 function go(route, params) {
+  if ($modal && $modal.innerHTML) closeModal(null);  // offener Dialog gehört zum alten Bildschirm
   S.route = route;
   S.params = params || {};
   window.scrollTo(0, 0);
@@ -182,6 +183,7 @@ async function refreshState() {
 const I = {
   logo: (s = 24) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 16.5s-3-1.8-3-3.6a1.5 1.5 0 0 1 3-.6 1.5 1.5 0 0 1 3 .6c0 1.8-3 3.6-3 3.6z"/></svg>`,
   folder: (s = 24) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>`,
+  mail: (s = 24) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="m4 7 8 6 8-6"/></svg>`,
   doc: (s = 24) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h4"/></svg>`,
   layers: (s = 28) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></svg>`,
   clock: (s = 28) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>`,
@@ -391,6 +393,7 @@ function updateDialog() {
 /* ===================== Ereignisse vom Programm ===================== */
 
 const HANDLERS = {
+  mail(m) { S.mail = m; if (S.route === "settings") redrawMailCard(); },
   inspect(st) {
     const was = S.inspect && S.inspect.phase;
     S.inspect = st;
@@ -804,6 +807,114 @@ function drawCollection(c) {
   };
 }
 
+/* ---------- Mails weiterleiten ---------- */
+function agoText(ts) {
+  if (!ts) return "noch nie";
+  const min = Math.round((Date.now() / 1000 - ts) / 60);
+  if (min < 1) return "gerade eben";
+  if (min < 60) return `vor ${plural(min, "Minute", "Minuten")}`;
+  const h = Math.round(min / 60);
+  return h < 24 ? `vor ${plural(h, "Stunde", "Stunden")}` : `am ${new Date(ts * 1000).toLocaleDateString("de-DE")}`;
+}
+
+function mailCardHTML() {
+  const m = S.mail;
+  if (!m) return "";
+  const head = `<h2 style="font-size:1.3125rem" class="row g10">${I.mail()} Mails weiterleiten</h2>`;
+  if (!m.address || !m.has_password) {
+    return `<section class="card stack g12">${head}
+      <span class="muted">Leite Rechnungen und Dokumente einfach vom Handy an eine eigene Ablage-Adresse weiter. Ich hole sie ab, solange ich geöffnet bin, und lege den Anhang oder die ganze Mail ab.</span>
+      <button type="button" class="btn violet" style="align-self:flex-start" data-act="mailSetup">Ablage-Postfach einrichten</button></section>`;
+  }
+  const unknown = (m.unknown || []).map((u) => `<div class="row g10 wrapflex"><span class="grow" style="flex-basis:14rem;overflow-wrap:anywhere"><b>${esc(u.address)}</b>${u.subject ? ` <span class="small muted">„${esc(u.subject)}“</span>` : ""}</span>
+    <button type="button" class="btn small" data-act="mailAllow" data-addr="${esc(u.address)}">Freigeben</button></div>`).join("");
+  return `<section class="card stack g12">${head}
+    <button type="button" class="switch" aria-pressed="${m.enabled}" data-act="mailToggle"><span class="track"><span class="knob"></span></span>Mails aus <b style="margin-left:0.3em">${esc(m.address)}</b>&nbsp;abholen</button>
+    <span class="small muted">Angenommen von: ${esc((m.senders || []).join(", "))}</span>
+    <span class="small ${m.error ? "" : "muted"}">${m.error ? `${I.warn(18)} ${esc(m.error)}` : `Zuletzt nachgeschaut: ${esc(agoText(m.last_ok))}${m.imported ? ` · bisher ${plural(m.imported, "Mail", "Mails")} abgeholt` : ""}`}</span>
+    ${unknown ? `<div class="notice info stack g8" style="display:flex"><b>Mails von unbekannten Absendern</b><span class="small">Die lasse ich im Postfach liegen. Wenn es deine sind, gib sie frei:</span>${unknown}</div>` : ""}
+    <div class="row g10 wrapflex"><button type="button" class="btn small violet" data-act="mailNow" ${m.enabled ? "" : "disabled"}>Jetzt nachschauen</button>
+      <button type="button" class="btn small" data-act="mailSetup">Ändern</button></div></section>`;
+}
+
+function redrawMailCard() {
+  const box = document.getElementById("mail-card");
+  if (!box) return;
+  const html = mailCardHTML();
+  if (box.dataset.html !== html) { box.innerHTML = html; box.dataset.html = html; }
+}
+
+function mailActions() {
+  const set = (m) => { if (m) { S.mail = m; redrawMailCard(); } };
+  return {
+    mailSetup: () => mailSetupDialog(),
+    mailToggle: async () => set(await tryCall("mail_enable", !(S.mail && S.mail.enabled))),
+    mailAllow: async (el) => { const m = await tryCall("mail_allow_sender", el.dataset.addr); if (m) { set(m); toast("Freigegeben – ich hole die Mails gleich ab."); } },
+    mailNow: async (el) => {
+      el.disabled = true; el.innerHTML = `<div class="spinner small"></div> Schaue nach …`;
+      const r = await tryCall("mail_fetch_now");
+      if (r) { set(r); toast(r.error ? r.error : r.new ? `${plural(r.new, "neue Mail", "neue Mails")} abgeholt.` : "Keine neuen Mails."); }
+      else redrawMailCard();
+    },
+  };
+}
+
+function mailSetupDialog() {
+  const m = S.mail || {};
+  const body = (prov, err) => `<h2>Ablage-Postfach einrichten</h2>
+    <p class="small muted">Am besten eine eigene, kostenlose Adresse nur für die Ablage (z. B. bei GMX oder WEB.DE). Ordnungsliebe schaut nur in dieses Postfach.</p>
+    <label class="stack g6"><span class="label">Adresse des Ablage-Postfachs</span>
+      <input class="text" id="mail-addr" type="email" autocomplete="off" data-input="addr" value="${esc(m.address || "")}" placeholder="z. B. meine.ablage@gmx.de"></label>
+    <div id="mail-hint">${prov ? `<div class="notice ${prov.supported ? "info" : "warn"}">${I.info ? I.info() : ""}<div class="small">${esc(prov.hint)}</div></div>` : ""}</div>
+    <label class="stack g6"><span class="label">Passwort${m.has_password ? " <span class='tiny muted'>(leer lassen = unverändert)</span>" : ""}</span>
+      <input class="text" id="mail-pw" type="password" autocomplete="new-password"></label>
+    <label class="stack g6"><span class="label">Von welchen Adressen leitest du weiter?</span>
+      <input class="text" id="mail-from" autocomplete="off" value="${esc((m.senders || []).join(", "))}" placeholder="z. B. karl@icloud.com, erika@gmx.de">
+      <span class="tiny muted">Nur Mails von diesen Absendern lege ich ab – alles andere bleibt im Postfach liegen.</span></label>
+    <details class="tiny"><summary class="muted">Server selbst eintragen</summary>
+      <div class="row g8" style="margin-top:0.5rem"><input class="text" id="mail-host" placeholder="IMAP-Server, z. B. imap.gmx.net" value="${esc(m.host || "")}"><input class="text" id="mail-port" style="max-width:6rem" value="${esc(String(m.port || 993))}"></div></details>
+    <div id="mail-err">${err ? `<div class="notice warn">${I.warn()}<div>${esc(err)}</div></div>` : ""}</div>
+    <div class="btns">${m.address ? `<button type="button" class="btn link" data-act="forget">Entfernen</button>` : ""}
+      <button type="button" class="btn" data-act="cancel">Abbrechen</button>
+      <button type="button" class="btn primary" data-act="save">Prüfen und speichern</button></div>`;
+  let timer = null;
+  const showHint = async (addr) => {
+    const box = document.getElementById("mail-hint");
+    if (!box || !addr.includes("@")) { if (box) box.innerHTML = ""; return; }
+    const prov = await tryCall("mail_provider", addr);
+    if (prov && document.getElementById("mail-hint")) {
+      document.getElementById("mail-hint").innerHTML = `<div class="notice ${prov.supported ? "info" : "warn"}"><div class="small">${esc(prov.hint)}</div></div>`;
+      const host = document.getElementById("mail-host");
+      if (host && !host.value && prov.host) host.value = prov.host;
+    }
+  };
+  openModal(body(null, ""), {
+    addr: (el) => {
+      const err = document.getElementById("mail-err");
+      if (err) err.innerHTML = "";
+      clearTimeout(timer); timer = setTimeout(() => showHint(el.value.trim()), 400);
+    },
+    cancel: () => closeModal(null),
+    forget: async () => {
+      if (await tryCall("mail_forget")) { S.mail = await tryCall("mail_status"); closeModal(null); redrawMailCard(); toast("Ablage-Postfach entfernt."); }
+    },
+    save: async (el) => {
+      const v = (id) => (document.getElementById(id).value || "").trim();
+      el.disabled = true; el.innerHTML = `<div class="spinner small"></div> Prüfe die Anmeldung …`;
+      const senders = v("mail-from").split(/[,;\s]+/).filter(Boolean);
+      const r = await call("mail_save", v("mail-addr"), document.getElementById("mail-pw").value, senders, v("mail-host"), parseInt(v("mail-port"), 10) || 993).catch((e) => ({ __err: e.message }));
+      if (r && !r.__err) {
+        S.mail = r; closeModal(null); redrawMailCard();
+        toast("Eingerichtet! Leite eine Mail an " + r.address + " weiter – ich hole sie in ein paar Minuten ab.");
+      } else {
+        el.disabled = false; el.textContent = "Prüfen und speichern";
+        document.getElementById("mail-err").innerHTML = `<div class="notice warn">${I.warn()}<div>${esc((r && r.__err) || "Das hat nicht geklappt.")}</div></div>`;
+      }
+    },
+  }, true);
+  if (m.address) showHint(m.address);
+}
+
 /* ---------- Bestand prüfen (Steuer, Fristen) ---------- */
 function inspectCardHTML() {
   const st = S.inspect;
@@ -1178,6 +1289,7 @@ async function loadPreview() {
   const id = c.item.id;
   const page = c.page;
   const current = () => S.route === "single" && S.cur === c && c.item && c.item.id === id;
+  if (c.item.stage === "mail") return;  // eigene Ansicht ohne Seitenvorschau
   if (c.item.stage === "stack") {
     const thumbs = await tryCall("thumbs", id);
     if (current()) { c.thumbs = thumbs || []; drawSingle(); }
@@ -1242,6 +1354,7 @@ function drawSingle() {
   const it = c.item;
   if (it.stage === "stack") return drawStack();
   if (it.stage === "duplicate") return drawDuplicate();
+  if (it.stage === "mail") return drawMail();
 
   let right;
   if (c.waitingFor || it.status === "waiting" || it.status === "analyzing") {
@@ -1257,7 +1370,7 @@ function drawSingle() {
   } else {
     const s = it.suggestion;
     const [stem, ext] = splitName(s.filename);
-    right = `<div class="stack g8"><span class="eyebrow">Mein Vorschlag</span><h1 class="suggest-title">${esc(s.summary || stem)}</h1></div>
+    right = `<div class="stack g8"><span class="eyebrow">Mein Vorschlag${it.mail_from ? ` · aus der Mail „${esc(it.mail_from)}“` : ""}</span><h1 class="suggest-title">${esc(s.summary || stem)}</h1></div>
       ${confBox(it)}
       ${s.reason ? `<p class="small muted" style="margin-top:-0.5rem"><b style="color:var(--text-2)">Warum:</b> ${esc(s.reason)}</p>` : ""}
       <div class="card stack g20">
@@ -1468,6 +1581,56 @@ function zoomPreview() {
 }
 
 /* ---------- Scan-Stapel ---------- */
+/* ---------- Weitergeleitete Mail: Anhang, ganze Mail oder beides? ---------- */
+function drawMail() {
+  const c = S.cur;
+  const it = c.item;
+  const m = it.mail || {};
+  const [backLabel, backFn] = backTo(c.origin);
+  const date = m.date ? m.date.split("-").reverse().join(".") : "";
+  const docs = m.docs || [];
+  setHTML(`<div class="screen">${topbar(backLabel, "back", c.remaining ? `Noch ${plural(c.remaining, "Dokument", "Dokumente")}` : "")}
+    <main class="wrap narrow">
+      <div class="stack g10"><span class="eyebrow">Weitergeleitete Mail</span>
+        <h1 class="title" style="overflow-wrap:anywhere">${esc(m.subject || it.name)}</h1>
+        <p class="lead" style="margin:0">Was davon soll in die Ablage? ${esc(m.reason || "")}</p></div>
+      <section class="card stack g12 mailcard">
+        <div class="mailhead"><span class="muted">Von</span><span style="overflow-wrap:anywhere">${esc(m.sender || "")}</span>
+          ${date ? `<span class="muted">Datum</span><span>${esc(date)}</span>` : ""}
+          ${m.note ? `<span class="muted">Deine Notiz</span><span><b>${esc(m.note)}</b> <span class="tiny muted">– gebe ich der KI als Hinweis mit</span></span>` : ""}</div>
+        <hr class="hr">
+        <p class="mailtext">${esc(m.excerpt || "(kein Text)")}${(m.excerpt || "").length >= 600 ? " …" : ""}</p>
+        ${docs.length ? `<hr class="hr"><div class="stack g8"><span class="label">Anhänge</span>
+          ${docs.map((d) => `<span class="row g8">${I.doc(20)} <span style="overflow-wrap:anywhere">${esc(d)}</span></span>`).join("")}
+          ${(m.skipped || []).length ? `<span class="tiny muted">Nicht dabei (Logos, Signaturen o. Ä.): ${esc(m.skipped.join(", "))}</span>` : ""}</div>` : ""}
+      </section>
+      <div class="stack g12">
+        ${docs.length ? `<button type="button" class="choice" data-act="mailAtt"><div class="icon-box">${I.doc(24)}</div>
+          <div class="stack g4 grow"><span style="font-size:1.1875rem;font-weight:600">Nur ${docs.length === 1 ? "den Anhang" : `die ${docs.length} Anhänge`}</span>
+          <span class="muted">Die Mail selbst war nur das Anschreiben.</span></div>${I.right()}</button>` : ""}
+        <button type="button" class="choice" data-act="mailWhole"><div class="icon-box">${I.mail(24)}</div>
+          <div class="stack g4 grow"><span style="font-size:1.1875rem;font-weight:600">Die ganze Mail als PDF</span>
+          <span class="muted">Der Text der Mail ist das Wichtige${docs.length ? " – die Anhänge lasse ich weg" : ""}.</span></div>${I.right()}</button>
+        ${docs.length ? `<button type="button" class="choice" data-act="mailBoth"><div class="icon-box">${I.plus(24)}</div>
+          <div class="stack g4 grow"><span style="font-size:1.1875rem;font-weight:600">Beides</span>
+          <span class="muted">Mail als PDF und ${docs.length === 1 ? "den Anhang" : "alle Anhänge"} – jedes wird einzeln einsortiert.</span></div>${I.right()}</button>` : ""}
+      </div>
+      <div class="row g12"><button type="button" class="btn link tall" data-act="skip">Später</button></div>
+    </main></div>`);
+  const pick = async (choice) => {
+    const n = await tryCall("mail_choice", it.id, choice);
+    if (n) { toast(n === 1 ? "Ich lese das Dokument jetzt und mache dir gleich einen Vorschlag." : `Ich lese die ${n} Dokumente jetzt und mache dir gleich Vorschläge.`); loadNextSingle(); }
+  };
+  S.actions = {
+    back: backFn,
+    mailAtt: () => pick("attachments"),
+    mailWhole: () => pick("mail"),
+    mailBoth: () => pick("both"),
+    skip: async () => { await tryCall("skip", it.id); loadNextSingle(); },
+  };
+  guardActions(c, ["mailAtt", "mailWhole", "mailBoth", "skip"]);
+}
+
 function drawStack() {
   const c = S.cur;
   const it = c.item;
@@ -1634,6 +1797,7 @@ function loadHints() {
 }
 
 SCREENS.settings = () => {
+  if (!S.soft) call("mail_status").then((m) => { S.mail = m; redrawMailCard(); }).catch(() => {});
   if (!S.params.fresh) {
     // Werte im Hintergrund auffrischen und nur bei Änderungen sanft nachzeichnen (kein zweites Einblenden)
     const before = JSON.stringify(S.state.settings);
@@ -1687,6 +1851,7 @@ SCREENS.settings = () => {
           <button type="button" class="textbtn" style="align-self:flex-start" data-act="forget">Gelerntes vergessen und neu anfangen …</button>
         </section>
       </div>
+      <div id="mail-card">${mailCardHTML()}</div>
       <section class="card stack g16"><h2 style="font-size:1.3125rem">Personen im Haushalt</h2>
           <span class="tiny muted">Wenn ich weiß, wer bei euch wohnt, merke ich mir bei jedem Dokument, für wen es ist.</span>
           <div class="row g8 wrapflex">${(s.persons || []).map((p, i) => `<span class="tag person">${I.user(16)} ${esc(p)}
@@ -1727,6 +1892,7 @@ SCREENS.settings = () => {
     },
     models: () => modelDialog(),
     backups: () => backupsDialog(),
+    ...mailActions(),
     personAdd: async () => {
       const f = document.getElementById("person-new");
       const v = (f.value || "").trim();

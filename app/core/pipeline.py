@@ -77,6 +77,7 @@ class Pipeline:
         self._stop = threading.Event()
         self._seen_sizes: dict[str, tuple[int, float]] = {}
         self._split_parts: set[str] = set()
+        self._part_info: dict[str, dict] = {}       # Teile aus Mails: Hinweis und Herkunft
         self._ignored_inbox: set[str] = set()
         self.reorg_folders: list[str] = []          # erlaubte Ordner während einer Neuordnung
         self.reorg_group: str = ""
@@ -224,7 +225,7 @@ class Pipeline:
                 "kind": reader.file_kind(path), "status": "waiting", "stage": "doc",
                 "suggestion": None, "excluded": [], "page_count": 1, "error": "",
                 "skip": 0, "created": time.time(), "split_done": str(path) in self._split_parts,
-                "dup_ignored": False, **extra}
+                "dup_ignored": False, **self._part_info.pop(str(path), {}), **extra}
         with self._lock:
             self.items[item_id] = item
         self._jobs.put((PRIO_NORMAL, next(self._seq), item_id, "analyze"))
@@ -279,6 +280,20 @@ class Pipeline:
             hit = self.dup.find(sha, [], exclude=src)
             if hit:
                 self._mark_duplicate(item, hit)
+                return
+        if item["origin"] == "inbox" and item.get("kind") == "email" and not item.get("mail_checked"):
+            from ..docs import mailparts
+            try:
+                plan = mailparts.analyze(src)
+            except Exception:
+                log.exception("Mail konnte nicht ausgewertet werden – wird als Ganzes behandelt")
+                plan = None
+            if plan is not None:
+                item["mail"] = plan.summary()
+                if plan.mode == "ask" or item.get("mail_ask"):
+                    item.update(stage="mail", status="ready")
+                    return
+                self._expand_mail(item, plan, "attachments" if plan.mode == "attachments" else "mail")
                 return
         doc = reader.read_document(src, sha=sha)
         item["page_count"] = doc.page_count
@@ -790,6 +805,99 @@ class Pipeline:
                                    "Bitte schließe es und versuche es noch einmal.")
             self.history.add("split", str(src), str(kept), "", parts=[str(p) for p in parts])
             self.items.pop(item_id, None)
+            for p in parts:
+                self.add_file(p, origin="inbox")
+        self._changed()
+        return len(parts)
+
+    def forget_path(self, path: Path) -> None:
+        """Eintrag zu einer Datei aus der Warteschlange nehmen (z. B. nach Rückgängig)."""
+        with self._lock:
+            for k in [k for k, i in self.items.items() if i["src"] == str(path) and i["status"] != "moving"]:
+                self.items.pop(k, None)
+            self._split_parts.discard(str(path))
+            self._dirty = True
+        self._changed()
+
+    # --- Mails: Anhänge und/oder Mail als PDF ablegen -------------------------------
+    def mail_choice(self, item_id: str, choice: str) -> int:
+        """Antwort aus der Einzelprüfung: attachments | mail | both."""
+        if choice not in ("attachments", "mail", "both"):
+            raise ValueError("Unbekannte Auswahl.")
+        with self._lock:
+            item = self.items.get(item_id)
+            if item is None or item["status"] != "ready" or item["stage"] != "mail":
+                raise ValueError("Die Mail wird gerade bearbeitet.")
+            item["status"] = "moving"
+        from ..docs import mailparts
+        try:
+            plan = mailparts.analyze(Path(item["src"]))
+            if choice == "attachments" and not plan.docs:
+                raise ValueError("Diese Mail hat keinen Anhang, den ich ablegen könnte.")
+        except Exception:
+            item["status"] = "ready"
+            raise
+        return self._expand_mail(item, plan, choice, from_review=True)
+
+    def _expand_mail(self, item: dict, plan, choice: str, from_review: bool = False) -> int:
+        """Legt Anhänge und/oder die Mail als PDF als neue Dokumente in den Scan-Ordner; die Mail selbst
+        kommt in den Ordnungsliebe-Papierkorb (30 Tage, über den Verlauf zurückholbar)."""
+        from ..docs import mailparts
+        src = Path(item["src"])
+        work = paths.cache_dir() / "mails" / item["id"]
+        work.mkdir(parents=True, exist_ok=True)
+        built: list[Path] = []
+        try:
+            if choice in ("attachments", "both"):
+                for k, att in enumerate(plan.docs, 1):
+                    stem, suffix = Path(att.name).stem, Path(att.name).suffix.lower() or ".pdf"
+                    tmp = naming.unique_path(work / naming.clean_filename(stem or f"Anhang {k}", suffix))
+                    tmp.write_bytes(att.data)
+                    if tmp.stat().st_size != att.size:
+                        raise IOError("Anhang unvollständig gespeichert.")
+                    built.append(tmp)
+            if choice in ("mail", "both"):
+                title = " ".join(x for x in (plan.date, plan.subject or "E-Mail") if x)
+                built.append(mailparts.to_pdf(plan, naming.unique_path(work / naming.clean_filename(title, ".pdf"))))
+            if not built:
+                raise ValueError("In dieser Mail habe ich nichts zum Ablegen gefunden.")
+        except Exception:
+            item["status"] = "ready" if from_review else item.get("status", "ready")
+            if not from_review:  # automatische Entscheidung ging schief → Nutzer fragen
+                item.update(stage="mail", status="ready", mail_checked=False)
+                return 0
+            raise
+        hint = plan.note
+        inbox = src.parent
+        parts = []
+        with self._lock:
+            try:
+                for b in built:
+                    dst = library.move_file(b, naming.unique_path(inbox / b.name))
+                    self._split_parts.add(str(dst))
+                    info = {"mail_from": plan.subject or plan.sender}
+                    if hint:
+                        info["hint"] = hint
+                    self._part_info[str(dst)] = info
+                    parts.append(dst)
+                kept = _trash(src)
+            except Exception:
+                for p in parts:
+                    try:
+                        p.unlink()
+                    except OSError:
+                        log.warning("Teil konnte nicht zurückgenommen werden: %s", p)
+                    self._split_parts.discard(str(p))
+                    self._part_info.pop(str(p), None)
+                item["status"] = "ready"
+                if not from_review:
+                    item.update(stage="mail")
+                    return 0
+                raise RuntimeError("Die Mail ist gerade von einem anderen Programm geöffnet. "
+                                   "Bitte schließe es und versuche es noch einmal.")
+            self.history.add("mail", str(src), str(kept), "", parts=[str(p) for p in parts],
+                             subject=plan.subject, choice=choice)
+            self.items.pop(item["id"], None)
             for p in parts:
                 self.add_file(p, origin="inbox")
         self._changed()

@@ -122,11 +122,15 @@ def test_email_and_office(env):
                     timeout=180)
     items = list(api.pipeline.items.values())
     by_kind = {i["kind"]: i for i in items}
-    assert by_kind["email"]["suggestion"]["filename"].endswith(".eml")
+    # Der Anhang der Mail ist kaputt → die Mail selbst wird als PDF abgelegt
+    mail_pdf = by_kind["pdf"]
+    assert mail_pdf["mail_from"] == "Ihre Stromabrechnung 2026" and "Stromabrechnung" in mail_pdf["name"]
     assert by_kind["office"]["suggestion"]["filename"].endswith(".docx")
-    prev = api.preview(by_kind["email"]["id"])["data"]
-    assert prev["type"] == "email" and prev["view"]["subject"] == "Ihre Stromabrechnung 2026"
-    assert prev["view"]["attachments"] == ["Abrechnung.pdf"]
+    prev = api.preview(mail_pdf["id"])["data"]
+    assert prev["type"] != "email"
+    from app.docs import office
+    view = office.parse_email(next(Path(e["dst"]) for e in api.history.entries if e["action"] == "mail"))
+    assert view["subject"] == "Ihre Stromabrechnung 2026" and view["attachments"] == ["Abrechnung.pdf"]
     api.shutdown()
 
 
