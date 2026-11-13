@@ -81,7 +81,7 @@ def dir_size(root: Path) -> tuple[int, int]:
 
 
 RUNNING = ("backup", "reading", "structure")
-ACTIVE = RUNNING + ("paused", "structure_review", "review")
+ACTIVE = RUNNING + ("paused", "structure_review", "review", "finishing")
 
 
 class Reorganizer:
@@ -107,12 +107,24 @@ class Reorganizer:
         if self.state.get("phase") in RUNNING:
             self.state.update(paused_phase=self.state["phase"], phase="paused")
             self._save()
+        if self.state.get("phase") == "finishing":  # beim Abschließen unterbrochen → nochmal abschließen lassen
+            self.state["phase"] = "review"
+            self._save()
         if self.state.get("phase") == "review":
             self._requeue_review()
 
     @property
     def root(self) -> Path:
         return Path(self.settings_store.get().library_dir)
+
+    @property
+    def copy_mode(self) -> bool:
+        return bool(self.state.get("target"))
+
+    @property
+    def dest(self) -> Path:
+        """Wohin einsortiert wird: der neue Zielordner (Kopie) oder die Ablage selbst."""
+        return Path(self.state["target"]) if self.state.get("target") else self.root
 
     def _save(self) -> None:
         jsonfile.save(self.state_path, self.state)
@@ -134,14 +146,34 @@ class Reorganizer:
         return st
 
     # --- Start, Pause, Fortsetzen ---------------------------------------------------
-    def start(self, mode: str) -> dict:
+    def check_target(self, target: str) -> Path:
+        """Neuer Zielordner: muss leer sein und darf nicht in der Ablage liegen (oder umgekehrt)."""
+        t = Path(target)
+        if not t.is_dir():
+            raise ReorgError("Den Zielordner gibt es nicht.")
+        src = self.root.resolve()
+        tr = t.resolve()
+        if tr == src or tr.is_relative_to(src) or src.is_relative_to(tr):
+            raise ReorgError("Der neue Ordner darf nicht in deiner Ablage liegen – und die Ablage nicht in ihm. "
+                             "Wähle einen Ordner daneben, z. B. „Ablage neu“.")
+        inbox = self.settings_store.get().inbox_dir
+        if inbox and (tr == Path(inbox).resolve() or tr.is_relative_to(Path(inbox).resolve())
+                      or Path(inbox).resolve().is_relative_to(tr)):
+            raise ReorgError("Der neue Ordner darf nicht der Scan-Ordner sein oder ihn enthalten.")
+        if any(p for p in t.iterdir() if not p.name.startswith(".") and p.name.lower() != "desktop.ini"):
+            raise ReorgError("Der neue Ordner ist nicht leer. Bitte wähle einen leeren Ordner oder lege einen neuen an.")
+        return t
+
+    def start(self, mode: str, target: str = "") -> dict:
         if self._thread and self._thread.is_alive():
             return self.status()
         if self.state.get("phase") in ("structure_review", "review", "paused"):
             return self.status()
-        gid = self.history.start_group("neuordnung", mode=mode, library=str(self.root))
+        t = self.check_target(target) if target else None
+        gid = self.history.start_group("neuordnung", mode=mode, library=str(self.root),
+                                       target=str(t) if t else "")
         self.state = {"group": gid, "mode": mode, "phase": "backup", "started": time.time(),
-                      "library": str(self.root)}
+                      "library": str(self.root), "target": str(t) if t else ""}
         self._save()
         self._launch("backup")
         return self.status()
@@ -162,6 +194,9 @@ class Reorganizer:
         if self.state.get("phase") != "paused" or (self._thread and self._thread.is_alive()):
             return self.status()
         lib = self.state.get("library")
+        if self.copy_mode and not self.dest.is_dir():
+            raise ReorgError(f"Der neue Ordner „{self.dest}“ ist nicht mehr da. Bitte brich die Neuordnung ab "
+                             "und starte sie neu.")
         if lib and Path(lib) != self.root:
             raise ReorgError("Die Ablage wurde inzwischen geändert. Bitte stelle sie in den Einstellungen wieder auf "
                              f"„{lib}“ oder brich die Neuordnung ab.")
@@ -175,6 +210,7 @@ class Reorganizer:
     def cancel(self) -> None:
         self._pause_requested = False
         self._cancel.set()
+        self.pipeline.reorg_target = None
         if self.state.get("phase") in ("structure_review", "review", "paused"):
             self.pipeline.remove_origin("reorg")
             gid = self.state.get("group", "")
@@ -272,6 +308,18 @@ class Reorganizer:
                 size += p.stat().st_size
             except OSError:
                 pass
+        if self.copy_mode:
+            # Kopie in einen neuen Ordner: keine Sicherung nötig, das Original bleibt unberührt
+            free = shutil.disk_usage(self.dest).free
+            need = size * 1.05 + 200 * 1024 * 1024
+            if free < need:
+                raise ReorgError(
+                    f"Für die Kopien werden etwa {need / 1e9:.1f} GB gebraucht, frei sind nur {free / 1e9:.1f} GB. "
+                    "Bitte mach Platz frei oder wähle einen Zielordner auf einem anderen Laufwerk.".replace(".", ",", 2))
+            self.state["backed_up"] = [str(p) for p in files]
+            self.state["copy_size"] = size
+            self._progress("backup", len(files), len(files))
+            return
         target = Path(self.state["backup_target"]) if self.state.get("backup_target") else None
         if target is None:
             free = shutil.disk_usage(paths.backups_dir()).free
@@ -403,7 +451,7 @@ class Reorganizer:
             raise ValueError("Die Struktur ist leer.")
         self.state["structure"] = folders
         self.state.pop("structure_draft", None)
-        self.schemes.set_all(self.root, folders)
+        self.schemes.set_all(self.dest, folders)
         self.state["phase"] = "review"
         self._save()
         self._requeue_review()
@@ -415,12 +463,13 @@ class Reorganizer:
         if not any(f["path"] == folder for f in struct):
             struct.append({"path": folder, "scheme": "JJJJ-MM Dokumentart", "example": ""})
             self._save()
-            self.schemes.set_one(self.root, folder, "JJJJ-MM Dokumentart", "")
+            self.schemes.set_one(self.dest, folder, "JJJJ-MM Dokumentart", "")
 
     def _requeue_review(self) -> None:
         folders = [f["path"] for f in self.state.get("structure", [])]
         self.pipeline.reorg_folders = folders
         self.pipeline.reorg_group = self.state.get("group", "")
+        self.pipeline.reorg_target = self.dest if self.copy_mode else None
         done = {e["src"] for e in self.history.group_entries(self.state.get("group", ""))}
         queued = {it["src"] for it in self.pipeline.items.values() if it["origin"] == "reorg"}
         for d in self.state.get("docs", []):
@@ -431,6 +480,8 @@ class Reorganizer:
 
     # --- Abschluss --------------------------------------------------------------------
     def finish(self) -> dict:
+        if self.copy_mode:
+            return self._finish_copy()
         group = self.history.groups.get(self.state.get("group", ""), {})
         root = Path(group.get("library") or self.root)
         removed = library.remove_empty_dirs(root)
@@ -442,6 +493,53 @@ class Reorganizer:
         self._save()
         self.bus.emit("reorg", self.status())
         return self.status()
+
+
+LEFTOVER = "_Noch zu sortieren"
+
+
+def _finish_copy_impl(self) -> dict:
+    """Neuordnung in einen neuen Ordner abschließen: Übriges kommt nach „_Noch zu sortieren“."""
+    gid = self.state["group"]
+    target = self.dest
+    src_root = Path(self.state.get("library") or self.root)
+    self.pipeline.remove_origin("reorg")
+    self.pipeline.reorg_target = None
+    done = {e["src"] for e in self.history.group_entries(gid)}
+    left = [d for d in self.state.get("docs", []) if d["path"] not in done]
+    left += [{"path": str(src_root.joinpath(*x["rel"].split("/"))), "rel": x["rel"], "sha": ""}
+             for x in self.state.get("skipped", [])]
+    copied, failed = 0, 0
+    self._progress("finishing", 0, len(left), save=True)
+    for i, d in enumerate(left, 1):
+        src = Path(d["path"])
+        if str(src) in done or not src.exists():
+            continue
+        rel_parent = d["rel"].split("/")[:-1]
+        folder = naming.clean_folder("/".join([LEFTOVER] + rel_parent))
+        target_file = naming.fit_path(naming.folder_to_path(target, folder) / src.name)
+        try:
+            created = [str(p) for p in library.missing_parents(target_file)]
+            dst = library.copy_file(src, target_file, sha=d.get("sha", ""))
+            self.history.add("reorg", str(src), str(dst), folder, group=gid, dst_sha=d.get("sha") or reader.file_hash(dst),
+                             dst_size=dst.stat().st_size, created_dirs=created, copy=True, leftover=True)
+            done.add(str(src))
+            copied += 1
+        except Exception:
+            log.exception("Nicht kopiert: %s", src)
+            failed += 1
+        if i % 10 == 0:
+            self._progress("finishing", i, len(left), src.name, save=False)
+    removed = library.remove_empty_dirs(target)
+    self.history.update_group(gid, done=True, removed_dirs=removed, count=len(self.history.group_entries(gid)))
+    self.state.update(phase="done", removed_dirs=removed, finished=time.time(), leftover=copied,
+                      leftover_failed=failed)
+    self._save()
+    self.bus.emit("reorg", self.status())
+    return self.status()
+
+
+Reorganizer._finish_copy = _finish_copy_impl
 
 
 # --- Rückgängig -----------------------------------------------------------------------
@@ -474,6 +572,14 @@ def undo_entry(entry: dict, settings, history, memory, dup, moved=None) -> str:
     src = Path(entry["src"])
     if action not in ("move", "reorg", "trash") or dst is None:
         raise ValueError("Diese Aktion lässt sich nicht rückgängig machen.")
+    if entry.get("info", {}).get("copy"):
+        if dst.exists():
+            if not _unchanged(dst, entry):
+                raise ValueError("Die Kopie wurde inzwischen verändert. Bitte lösche sie selbst.")
+            library.quarantine(dst)
+        memory.remove_ref(entry["id"])
+        history.mark_undone(entry["id"])
+        return str(src)
     if not dst.exists():
         raise FileNotFoundError("Die Datei liegt nicht mehr dort, wo sie abgelegt wurde.")
     if not _unchanged(dst, entry):
@@ -513,7 +619,7 @@ def undo_group(gid: str, history, memory, dup, moved=None) -> dict:
     """
     group = history.groups.get(gid) or {}
     root = Path(group.get("library", ""))
-    for rel in group.get("removed_dirs", []):
+    for rel in ([] if group.get("target") else group.get("removed_dirs", [])):
         try:
             naming.folder_to_path(root, rel).mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -525,7 +631,14 @@ def undo_group(gid: str, history, memory, dup, moved=None) -> dict:
             continue
         dst, src = Path(entry["dst"]), Path(entry["src"])
         try:
-            if dst != src:
+            if entry.get("info", {}).get("copy"):
+                # Kopie im neuen Ordner: einfach wieder entfernen (Papierkorb), das Original lag nie woanders
+                if dst.exists():
+                    if not _unchanged(dst, entry):
+                        failed += 1
+                        continue
+                    library.quarantine(dst)
+            elif dst != src:
                 if not _unchanged(dst, entry):
                     failed += 1
                     continue

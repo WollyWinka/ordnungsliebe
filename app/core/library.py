@@ -19,7 +19,7 @@ from . import naming
 
 log = logging.getLogger(__name__)
 
-MAX_DEPTH = 3
+MAX_DEPTH = 4
 SKIP_DIRS = {"$RECYCLE.BIN", "System Volume Information", ".Trash", "__MACOSX"}
 
 # Windows-Dateiattribute für Cloud-Dateien, die (noch) nicht lokal vorliegen
@@ -100,7 +100,7 @@ CLOUD_ERRORS = set(range(362, 400))
 
 
 def list_folders(root: Path) -> list[str]:
-    """Relative Ordnerpfade (mit „/“), bis zu drei Ebenen tief, alphabetisch."""
+    """Relative Ordnerpfade (mit „/“), bis zu vier Ebenen tief, alphabetisch."""
     out = []
     if not root.exists():
         return out
@@ -145,12 +145,13 @@ class Schemes:
         return self.data.get(str(root), {})
 
     def set_all(self, root: Path, folders: list[dict]) -> None:
-        self.data[str(root)] = {f["path"]: {"scheme": f.get("scheme", ""), "example": f.get("example", "")}
+        self.data[str(root)] = {f["path"]: {"scheme": f.get("scheme", ""), "example": f.get("example", ""),
+                                            "desc": f.get("desc", "")}
                                 for f in folders}
         jsonfile.save(self.path, self.data)
 
-    def set_one(self, root: Path, folder: str, scheme: str, example: str = "") -> None:
-        self.data.setdefault(str(root), {})[folder] = {"scheme": scheme, "example": example}
+    def set_one(self, root: Path, folder: str, scheme: str, example: str = "", desc: str = "") -> None:
+        self.data.setdefault(str(root), {})[folder] = {"scheme": scheme, "example": example, "desc": desc}
         jsonfile.save(self.path, self.data)
 
 
@@ -251,6 +252,40 @@ def move_file(src: Path, dst: Path) -> Path:
         except OSError:
             log.warning("Original %s konnte nach dem Kopieren nicht entfernt werden", src)
         return dst
+
+
+def copy_file(src: Path, dst: Path, sha: str = "") -> Path:
+    """Kopiert src nach dst (Original bleibt unberührt), ohne je etwas zu überschreiben.
+
+    Erst in eine Zwischendatei, dann Größe und Prüfsumme vergleichen, dann umbenennen.
+    Bei Cloud-Dateien wird mehrmals versucht (Download kann dauern)."""
+    if not src.exists():
+        raise FileNotFoundError(f"Die Datei {src.name} ist nicht mehr da.")
+    os.makedirs(long_path(dst.parent), exist_ok=True)
+    tmp = dst.with_name(f".~ordnungsliebe-{uuid.uuid4().hex[:8]}.part")
+    last: Exception | None = None
+    for attempt in range(4):
+        try:
+            shutil.copy2(long_path(src), long_path(tmp))
+            want = sha or _sha(src)
+            if os.path.getsize(long_path(tmp)) != os.path.getsize(long_path(src)) or _sha(tmp) != want:
+                raise OSError("Die Kopie ist unvollständig.")
+            with _MOVE_LOCK:
+                dst = naming.unique_path(dst)
+                os.rename(long_path(tmp), long_path(dst))
+            return dst
+        except FileNotFoundError:
+            raise
+        except OSError as exc:
+            last = exc
+            try:
+                os.unlink(long_path(tmp))
+            except OSError:
+                pass
+            if getattr(exc, "winerror", None) not in CLOUD_ERRORS and attempt >= 1:
+                break
+            time.sleep(2 + attempt * 3)
+    raise OSError(f"{src.name} ließ sich nicht kopieren.") from last
 
 
 def quarantine_dir() -> Path:

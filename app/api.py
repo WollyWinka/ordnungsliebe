@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 from . import APP_VERSION, paths
-from .ai import models
+from .ai import models, tasks
 from .ai.llm import make_ai
 from .core import library, naming, reorg, setup
 from .core.pipeline import Pipeline
@@ -1095,10 +1095,57 @@ class Api:
 
     # --- Neuordnung ---------------------------------------------------------------------
     @api_method
-    def reorg_start(self, mode: str):
+    def reorg_start(self, mode: str, target: str = ""):
         if mode not in ("neu", "verbessern"):
             raise ValueError("Unbekannte Variante")
-        return self.reorganizer.start(mode)
+        return self.reorganizer.start(mode, target or "")
+
+    @api_method
+    def reorg_check_target(self, target: str):
+        """Zielordner prüfen und anzeigen, wie viel Platz die Kopien brauchen."""
+        import shutil as _sh
+        t = self.reorganizer.check_target(target)
+        need = count = 0
+        for p in library.walk_documents(self.reorganizer.root, skip_photos=True):
+            count += 1
+            try:
+                need += p.stat().st_size
+            except OSError:
+                pass
+        free = _sh.disk_usage(t).free
+        return {"path": str(t), "pretty": setup.pretty_path(str(t)), "free_gb": round(free / 1e9, 1),
+                "need_gb": round(need * 1.05 / 1e9 + 0.05, 1), "count": count, "enough": free > need * 1.05 + 2e8}
+
+    # --- Struktur als Datei (G) -----------------------------------------------------------
+    @api_method
+    def structure_parse(self, text: str):
+        from .core import structure_io
+        if len(text or "") > 500_000:
+            raise ValueError("Die Datei ist zu groß für eine Ordnerstruktur.")
+        folders, warnings = structure_io.parse(text or "")
+        if not folders:
+            raise ValueError("In dem Text habe ich keine Ordner gefunden. Eine Zeile pro Ordner, Unterordner eingerückt.")
+        return {"folders": tasks.clean_structure(folders), "warnings": warnings}
+
+    @api_method
+    def structure_export(self, folders: list):
+        from .core import export, structure_io
+        text = structure_io.export(tasks.clean_structure(folders or []))
+        target = naming.unique_path(export.export_dir() / f"Ordnungsliebe Struktur {time.strftime('%Y-%m-%d')}.txt")
+        target.write_text(text, encoding="utf-8")
+        return {"path": str(target), "name": target.name, "folder": setup.pretty_path(str(target.parent)),
+                "text": text}
+
+    @api_method
+    def structure_ai_brief(self, folders: list = None):
+        from .core import structure_io
+        docs = self.reorganizer.state.get("docs") or []
+        if not docs:  # außerhalb einer Neuordnung: aktuelle Ablage beschreiben
+            root = self.library_root()
+            if root:
+                docs = [{"rel": "/".join(p.relative_to(root).parts)}
+                        for p, _ in zip(library.walk_documents(root, skip_photos=True), range(20000))]
+        return structure_io.ai_brief(docs, tasks.clean_structure(folders or []))
 
     @api_method
     def reorg_status(self):
@@ -1117,6 +1164,29 @@ class Api:
         r = self.reorganizer.finish()
         self.index_library_async()
         return r
+
+    @api_method
+    def reorg_use_target(self):
+        """Nach der Neuordnung in einen neuen Ordner: diesen ab jetzt als Ablage verwenden."""
+        st = self.reorganizer.state
+        target = st.get("target")
+        if st.get("phase") != "done" or not target or not Path(target).is_dir():
+            raise ValueError("Es gibt keinen neuen Ordner, auf den ich umstellen könnte.")
+        inbox = self.settings_store.get().inbox_dir
+        if inbox and _nested(Path(inbox), Path(target)):
+            raise ValueError("Der Scan-Ordner liegt in dem neuen Ordner – so geht es nicht.")
+        old = self.settings_store.get().library_dir
+        self.settings_store.update(library_dir=target)
+        # Fristen, Mappen und Suche zeigen ab jetzt auf die Kopien
+        for e in self.history.group_entries(st.get("group", "")):
+            if e.get("info", {}).get("copy") and not e.get("undone"):
+                self.docmeta.moved(e["src"], e["dst"])
+        st["switched"] = True
+        st["old_library"] = old
+        self.reorganizer._save()
+        self.index_library_async()
+        self.bus.emit("reorg", self.reorganizer.status())
+        return {"library": setup.pretty_path(target), "old": setup.pretty_path(old)}
 
     @api_method
     def reorg_pause(self):

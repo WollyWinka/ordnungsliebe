@@ -110,6 +110,8 @@ def _folder_block(allowed: list[str], folder_info: dict, folder_counts: dict | N
     def line(f: str, level: int) -> str:
         info = folder_info.get(f, {})
         parts = [f]
+        if info.get("desc"):
+            parts.append(info["desc"] if level >= 1 else info["desc"][:60])
         if level >= 1 and info.get("scheme"):
             parts.append(f"Schema: {info['scheme']}")
         if level >= 1 and folder_counts and folder_counts.get(f):
@@ -167,7 +169,7 @@ def _postprocess(raw: dict, *, original: Path, kind: str, folders: list[str], ex
             folder = lower_map[candidate.lower()]
         elif (candidate and allow_new and candidate.lower() not in lower_map
               and (not new_only_below or "/".join(candidate.split("/")[:-1]).lower() in lower_map)):
-            folder = "/".join(candidate.split("/")[:3])  # höchstens drei Ebenen
+            folder = "/".join(candidate.split("/")[:naming.MAX_LEVELS])  # höchstens vier Ebenen
             is_new = True
         else:
             # Kein brauchbarer Ordner: Elternordner des Vorschlags, sonst Alternative – aber nie „sicher“
@@ -271,13 +273,14 @@ def clean_structure(folders: list[dict]) -> list[dict]:
     seen, out = set(), []
     for f in folders:
         path = naming.clean_folder(str(f.get("path") or ""))
-        path = "/".join(path.split("/")[:3])
+        path = "/".join(path.split("/")[:naming.MAX_LEVELS])
         if not path or path.lower() in seen:
             continue
         seen.add(path.lower())
         out.append({"path": path,
                     "scheme": str(f.get("scheme") or "JJJJ-MM Dokumentart").strip()[:80],
-                    "example": naming.clean_part(str(f.get("example") or ""), "")[:80]})
+                    "example": naming.clean_part(str(f.get("example") or ""), "")[:80],
+                    "desc": re.sub(r"\s+", " ", str(f.get("desc") or "")).strip()[:160]})
     # Elternordner ergänzen, falls nur tiefere Ordner genannt wurden
     for f in list(out):
         parts = f["path"].split("/")
@@ -285,7 +288,7 @@ def clean_structure(folders: list[dict]) -> list[dict]:
             parent = "/".join(parts[:depth])
             if parent.lower() not in seen:
                 seen.add(parent.lower())
-                out.append({"path": parent, "scheme": "JJJJ-MM Dokumentart", "example": ""})
+                out.append({"path": parent, "scheme": "JJJJ-MM Dokumentart", "example": "", "desc": ""})
     out.sort(key=lambda f: f["path"].lower())
     return out
 

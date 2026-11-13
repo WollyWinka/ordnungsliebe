@@ -2270,6 +2270,7 @@ SCREENS.reorg = () => {
   const r = S.state.reorg || {};
   const phase = r.phase || "";
   if (["backup", "reading", "structure"].includes(phase)) return drawReorgProgress(r);
+  if (phase === "finishing") return drawReorgFinishing(r);
   if (phase === "paused") return drawReorgPaused(r);
   if (phase === "structure_review") return drawStructure();
   if (phase === "review") return drawReorgHub(r);
@@ -2277,13 +2278,29 @@ SCREENS.reorg = () => {
   return drawReorgIntro(r);
 };
 
-function drawReorgIntro(r) {
+function drawReorgIntro(r, cached) {
   S.reorgMode = S.reorgMode || "neu";
-  setHTML(`<div class="screen">${topbar("Zur Startseite", "back", "Ablage neu ordnen")}
-    <main class="wrap narrow"><div class="waiting"><div class="spinner"></div></div></main></div>`);
-  S.actions = { back: () => go("home") };
-  call("library_overview").then((li) => {
+  S.reorgWhere = S.reorgWhere || "inplace";
+  if (!cached) {
+    setHTML(`<div class="screen">${topbar("Zur Startseite", "back", "Ablage neu ordnen")}
+      <main class="wrap narrow"><div class="waiting"><div class="spinner"></div></div></main></div>`);
+    S.actions = { back: () => go("home") };
+  }
+  (cached ? Promise.resolve(cached) : call("library_overview")).then((li) => {
     if (S.route !== "reorg") return;
+    const redraw = () => drawReorgIntro(r, li);
+    const tgt = S.reorgTarget;
+    const where = (id, title, text) => `<button type="button" class="choice ${S.reorgWhere === id ? "on" : ""}" data-act="where" data-id="${id}" style="align-items:flex-start">
+      <input type="radio" name="where" ${S.reorgWhere === id ? "checked" : ""} tabindex="-1" aria-hidden="true" style="margin-top:0.25rem">
+      <div class="stack g4"><span style="font-size:1.1875rem;font-weight:600">${title}</span><span class="muted">${text}</span></div></button>`;
+    const copyBox = S.reorgWhere !== "copy" ? "" : `<div class="card stack g10" style="margin-left:2.25rem">
+      ${tgt ? `<div class="row g10 wrapflex"><span style="color:var(--violet)">${I.folder()}</span><b class="grow" style="overflow-wrap:anywhere">${esc(tgt.pretty)}</b>
+        <button type="button" class="btn small" data-act="pickTarget">Anderer Ordner</button></div>
+        <span class="small ${tgt.enough ? "muted" : ""}">${tgt.enough ? `Die Kopien brauchen etwa ${String(tgt.need_gb).replace(".", ",")} GB, frei sind ${String(tgt.free_gb).replace(".", ",")} GB.` : `${I.warn(18)} Zu wenig Platz: gebraucht werden etwa ${String(tgt.need_gb).replace(".", ",")} GB, frei sind nur ${String(tgt.free_gb).replace(".", ",")} GB.`}</span>`
+        : `<span class="muted">Wähle einen leeren Ordner neben deiner Ablage – oder lege dort einen neuen an, z. B. „Ablage neu“.</span>
+        <button type="button" class="btn violet small" style="align-self:flex-start" data-act="pickTarget">${I.folder(18)} Neuen Ordner wählen</button>`}
+      ${li && li.cloud_only ? `<span class="tiny muted">Dateien, die nur in der Cloud liegen, lade ich zum Kopieren herunter. Liegt der neue Ordner in der iCloud, wird alles hochgeladen.</span>` : ""}
+    </div>`;
     const opt = (id, title, text) => `<button type="button" class="choice ${S.reorgMode === id ? "on" : ""}" data-act="mode" data-id="${id}" style="align-items:flex-start">
       <input type="radio" name="mode" ${S.reorgMode === id ? "checked" : ""} tabindex="-1" aria-hidden="true" style="margin-top:0.25rem">
       <div class="stack g4"><span style="font-size:1.1875rem;font-weight:600">${title}</span><span class="muted">${text}</span></div></button>`;
@@ -2302,7 +2319,15 @@ function drawReorgIntro(r) {
           ${opt("neu", "Komplett neue Struktur", "Ich entwerfe aus deinen Dokumenten eine neue, übersichtliche Ordnerstruktur.")}
           ${opt("verbessern", "Bestehende Ordner verbessern", "Deine Ordner bleiben die Grundlage. Ich schlage Zusammenlegungen, neue Ordner und falsch abgelegte Dateien vor.")}
         </div>
-        <div class="notice ok">${I.shield()}<div><b>Erst wird alles gesichert</b>Bevor ich etwas verändere, mache ich eine vollständige Sicherung deiner Ablage. Jeder Schritt lässt sich rückgängig machen.</div></div>
+        <div class="stack g12" role="radiogroup" aria-label="Wohin">
+          <span class="label">Wohin?</span>
+          ${where("inplace", "In der bestehenden Ablage umbauen", "Die Dateien werden in deiner Ablage verschoben.")}
+          ${where("copy", "In einen neuen Ordner kopieren", "Deine Ablage bleibt genau, wie sie ist. Ich lege die neue Ordnung als Kopie in einem neuen Ordner an – den kannst du in Ruhe prüfen und umbauen.")}
+          ${copyBox}
+        </div>
+        ${S.reorgWhere === "copy"
+          ? `<div class="notice ok">${I.shield()}<div><b>Deine Ablage bleibt unberührt</b>Ich kopiere nur – jede Kopie wird geprüft. Am Ende entscheidest du, ob der neue Ordner deine Ablage wird.</div></div>`
+          : `<div class="notice ok">${I.shield()}<div><b>Erst wird alles gesichert</b>Bevor ich etwas verändere, mache ich eine vollständige Sicherung deiner Ablage. Jeder Schritt lässt sich rückgängig machen.</div></div>`}
         <div class="actions" style="border:none;padding:0"><span class="muted small" style="align-self:center">Das Einlesen dauert je nach Menge eine Weile – du kannst nebenbei weiterarbeiten.</span>
           <button type="button" class="btn primary tall shadow" data-act="start" ${li && li.count ? "" : "disabled"}>Neuordnung starten ${I.right()}</button></div>
         ${li && li.ok && !li.count ? `<p class="muted">In deiner Ablage liegen noch keine Dokumente – hier gibt es nichts aufzuräumen.</p>` : ""}
@@ -2312,7 +2337,16 @@ function drawReorgIntro(r) {
       </main></div>`);
     S.actions = {
       back: () => go("home"),
-      mode: (el) => { S.reorgMode = el.dataset.id; drawReorgIntro(r); },
+      mode: (el) => { S.reorgMode = el.dataset.id; redraw(); },
+      where: (el) => { S.reorgWhere = el.dataset.id; redraw(); },
+      pickTarget: async () => {
+        const lib = S.state.settings.library_dir || "";
+        const parent = lib.replace(/[\\/][^\\/]+[\\/]?$/, "");
+        const f = await browseFolder(parent || lib, "Wohin soll die neue Ordnung? (leerer Ordner)", true);
+        if (!f) return;
+        const chk = await tryCall("reorg_check_target", f.path);
+        if (chk) { S.reorgTarget = chk; redraw(); }
+      },
       refine: () => { S.refine = null; go("refine", { from: "reorg" }); },
       changeLib: async () => {
         const f = await browseFolder(S.state.settings.library_dir, "Welcher Ordner soll neu geordnet werden?", false);
@@ -2322,8 +2356,11 @@ function drawReorgIntro(r) {
       },
       keepLocal: async (el) => { el.disabled = true; await tryCall("keep_local", S.state.settings.library_dir); },
       start: async (el) => {
+        const copy = S.reorgWhere === "copy";
+        if (copy && !S.reorgTarget) { toast("Bitte wähle zuerst den neuen Ordner."); return; }
+        if (copy && !S.reorgTarget.enough) { toast("Im neuen Ordner ist zu wenig Platz."); return; }
         el.disabled = true;
-        const st = await tryCall("reorg_start", S.reorgMode);
+        const st = await tryCall("reorg_start", S.reorgMode, copy ? S.reorgTarget.path : "");
         if (st) { S.state.reorg = st; S.struct = null; render(); } else el.disabled = false;
       },
     };
@@ -2331,7 +2368,7 @@ function drawReorgIntro(r) {
 }
 
 function drawReorgPaused(r) {
-  const label = { backup: "Sicherung anlegen", reading: "Dokumente lesen", structure: "Ordnerstruktur entwerfen" }[r.paused_phase] || "";
+  const label = { backup: r.target ? "Dokumente zählen" : "Sicherung anlegen", reading: "Dokumente lesen", structure: "Ordnerstruktur entwerfen" }[r.paused_phase] || "";
   setHTML(`<div class="screen">${topbar("Zur Startseite", "back", "Ablage neu ordnen")}
     <main class="wrap narrow">
       <div class="stack g10"><h1 class="title">Die Neuordnung ist pausiert</h1>
@@ -2355,7 +2392,7 @@ function drawReorgPaused(r) {
 }
 
 function drawReorgProgress(r) {
-  const phases = [["backup", "Sicherung anlegen"], ["reading", "Dokumente lesen"], ["structure", "Ordnerstruktur entwerfen"]];
+  const phases = [["backup", r.target ? "Dokumente zählen und Platz prüfen" : "Sicherung anlegen"], ["reading", "Dokumente lesen"], ["structure", "Ordnerstruktur entwerfen"]];
   const idx = phases.findIndex((p) => p[0] === r.phase);
   const pct = r.total ? Math.round((r.done / r.total) * 100) : 0;
   const list = phases.map(([id, label], i) => {
@@ -2395,9 +2432,9 @@ function structToTree(folders) {
     const parts = f.path.split("/");
     const top = parts[0];
     const sub = parts.slice(1).join("/");
-    if (!byName[top]) { byName[top] = { name: top, scheme: "", example: "", subs: [] }; tops.push(byName[top]); }
-    if (sub) byName[top].subs.push({ name: sub, scheme: f.scheme, example: f.example });
-    else { byName[top].scheme = f.scheme; byName[top].example = f.example; }
+    if (!byName[top]) { byName[top] = { name: top, scheme: "", example: "", desc: "", subs: [] }; tops.push(byName[top]); }
+    if (sub) byName[top].subs.push({ name: sub, scheme: f.scheme, example: f.example, desc: f.desc || "" });
+    else { byName[top].scheme = f.scheme; byName[top].example = f.example; byName[top].desc = f.desc || ""; }
   });
   return tops;
 }
@@ -2407,10 +2444,48 @@ function treeToStruct(tops) {
   tops.forEach((t) => {
     const top = t.name.trim();
     if (!top) return;
-    out.push({ path: top, scheme: t.scheme || "JJJJ-MM Dokumentart", example: t.example || "" });
-    t.subs.forEach((s) => { if (s.name.trim()) out.push({ path: top + "/" + s.name.trim(), scheme: s.scheme || "JJJJ-MM Dokumentart", example: s.example || "" }); });
+    out.push({ path: top, scheme: t.scheme || "JJJJ-MM Dokumentart", example: t.example || "", desc: t.desc || "" });
+    t.subs.forEach((s) => { if (s.name.trim()) out.push({ path: top + "/" + s.name.trim(), scheme: s.scheme || "JJJJ-MM Dokumentart", example: s.example || "", desc: s.desc || "" }); });
   });
   return out;
+}
+
+function importStructureDialog(st) {
+  openModal(`<h2>Eigene Struktur laden</h2>
+    <p class="small muted">Füge die Ordnerstruktur hier ein (z. B. die Antwort einer KI) oder wähle eine Textdatei. Eine Zeile pro Ordner, Unterordner eingerückt, höchstens 4 Ebenen. Hinter „ – “ darf stehen, was hineingehört.</p>
+    <textarea class="text" id="struct-text" style="min-height:14rem;font-family:ui-monospace,Consolas,monospace;font-size:0.9375rem" placeholder="Finanzen – Bank, Kredite, Geldanlagen
+  Girokonto – Kontoauszüge
+Arbeit
+  Entgeltnachweise"></textarea>
+    <div class="row g10 wrapflex"><label class="btn small" style="cursor:pointer">${I.doc(18)} Datei wählen …<input type="file" id="struct-file" accept=".txt,.md,.text,text/plain" style="display:none"></label>
+      <span class="tiny muted" id="struct-file-name"></span></div>
+    <div id="struct-err"></div>
+    <div class="btns"><button type="button" class="btn" data-act="cancel">Abbrechen</button><button type="button" class="btn primary" data-act="load">Übernehmen</button></div>`, {
+    cancel: () => closeModal(null),
+    load: async (el) => {
+      const text = document.getElementById("struct-text").value;
+      if (!text.trim()) { toast("Bitte erst eine Struktur einfügen oder eine Datei wählen."); return; }
+      el.disabled = true;
+      const r = await call("structure_parse", text).catch((e) => ({ __err: e.message }));
+      el.disabled = false;
+      if (r.__err) { document.getElementById("struct-err").innerHTML = `<div class="notice warn">${I.warn()}<div>${esc(r.__err)}</div></div>`; return; }
+      st.tops = structToTree(r.folders);
+      saveDraft();
+      closeModal(null);
+      drawStructure();
+      const tops = st.tops.length;
+      toast(`Struktur geladen: ${plural(tops, "Hauptordner", "Hauptordner")}, ${plural(r.folders.length, "Ordner", "Ordner")} insgesamt.` + (r.warnings.length ? " " + r.warnings.join(" ") : ""));
+    },
+  }, true);
+  const file = document.getElementById("struct-file");
+  file.addEventListener("change", () => {
+    const f = file.files && file.files[0];
+    if (!f) return;
+    if (f.size > 500000) { toast("Die Datei ist zu groß."); return; }
+    const reader = new FileReader();
+    reader.onload = () => { document.getElementById("struct-text").value = String(reader.result || ""); document.getElementById("struct-file-name").textContent = f.name; };
+    reader.readAsText(f, "utf-8");
+  });
 }
 
 let draftTimer = null;
@@ -2433,9 +2508,11 @@ function drawStructure() {
       <div class="row g10"><span style="color:var(--violet)">${I.folder()}</span>
         <input class="fname" value="${esc(t.name)}" aria-label="Ordnername" data-input="topName" data-t="${ti}">
         <button type="button" class="xbtn" data-act="delTop" data-t="${ti}" aria-label="Ordner entfernen" title="Ordner entfernen">${I.x(18)}</button></div>
+      ${t.desc ? `<span class="ex" style="padding-left:2.625rem;font-style:normal">${esc(t.desc)}</span>` : ""}
       ${st.showEx && t.example && !t.subs.length ? `<span class="ex" style="padding-left:2.625rem">${esc(exName(t))}</span>` : ""}
       <ul class="subs">${t.subs.map((s, si) => `<li><div class="row g4"><input class="fname subname" value="${esc(s.name)}" aria-label="Unterordner (weitere Ebene mit /)" data-input="subName" data-t="${ti}" data-s="${si}">
         <button type="button" class="xbtn" data-act="delSub" data-t="${ti}" data-s="${si}" aria-label="Unterordner entfernen" title="Unterordner entfernen">${I.x(16)}</button></div>
+        ${s.desc ? `<span class="ex" style="font-style:normal">${esc(s.desc)}</span>` : ""}
         ${st.showEx && s.example ? `<span class="ex">${esc(exName(s))}</span>` : ""}</li>`).join("")}
         <li><button type="button" class="btn link small" style="align-self:flex-start;padding:0" data-act="addSub" data-t="${ti}">${I.plus(16)} Unterordner</button></li></ul>
     </section>`).join("");
@@ -2444,7 +2521,12 @@ function drawStructure() {
       <div class="row between wrapflex g20" style="align-items:flex-end">
         <div class="stack g8" style="flex:1 1 32rem"><h1 class="title">So würde ich deine ${st.count} Dokumente ordnen</h1>
         <p class="lead">Klicke auf einen Ordnernamen, um ihn zu ändern. Noch wird nichts verschoben.</p></div>
-        <div class="notice ok" style="padding:0.75rem 1rem;align-items:center">${I.shield()}<span style="font-weight:600">Sicherung erstellt – alles lässt sich wiederherstellen</span></div>
+        <div class="notice ok" style="padding:0.75rem 1rem;align-items:center">${I.shield()}<span style="font-weight:600">${(S.state.reorg || {}).target ? "Deine Ablage bleibt unberührt – ich kopiere in den neuen Ordner" : "Sicherung erstellt – alles lässt sich wiederherstellen"}</span></div>
+      </div>
+      <div class="row g10 wrapflex">
+        <button type="button" class="btn small violet" data-act="importStruct">${I.doc(18)} Eigene Struktur laden</button>
+        <button type="button" class="btn small" data-act="exportStruct">Als Datei speichern</button>
+        <button type="button" class="btn small" data-act="aiBrief">Anleitung für eine KI kopieren</button>
       </div>
       ${st.skippedCount ? `<div class="notice warn">${I.cloud()}<div><b>${plural(st.skippedCount, "Datei konnte", "Dateien konnten")} nicht gesichert oder gelesen werden.</b>
         Diese bleiben genau, wo sie sind – ich fasse sie nicht an.${st.skipped.length ? `<div class="tiny" style="margin-top:0.375rem">z. B. ${st.skipped.slice(0, 3).map((x) => esc(x.rel.split("/").pop()) + " (" + esc(x.reason) + ")").join(", ")}</div>` : ""}</div></div>` : ""}
@@ -2459,6 +2541,32 @@ function drawStructure() {
   S.actions = {
     back: () => go("home"),
     toggleEx: () => { st.showEx = !st.showEx; drawStructure(); },
+    importStruct: () => importStructureDialog(st),
+    exportStruct: async () => {
+      const r = await tryCall("structure_export", treeToStruct(st.tops));
+      if (r) {
+        openModal(`<h2>Gespeichert</h2><p>„${esc(r.name)}“ liegt in <b>${esc(r.folder)}</b>. Du kannst sie bearbeiten oder einer KI geben und später wieder laden.</p>
+          <div class="btns"><button type="button" class="btn" data-act="close">Schließen</button><button type="button" class="btn primary" data-act="reveal">Im Ordner zeigen</button></div>`,
+          { close: () => closeModal(null), reveal: () => { tryCall("show_in_folder", r.path); closeModal(null); } });
+      }
+    },
+    aiBrief: async () => {
+      const text = await tryCall("structure_ai_brief", treeToStruct(st.tops));
+      if (!text) return;
+      let copied = false;
+      try { await navigator.clipboard.writeText(text); copied = true; } catch (e) { copied = false; }
+      openModal(`<h2>Anleitung für eine KI</h2>
+        <p class="small muted">${copied ? "Der Text ist in der Zwischenablage. " : ""}Füge ihn z. B. bei Claude ein. Er beschreibt das Format und welche Arten von Dokumenten du hast – Inhalte deiner Dokumente stehen nicht darin. Die Antwort lädst du dann mit „Eigene Struktur laden“.</p>
+        <textarea class="text" style="min-height:16rem;font-size:0.875rem;font-family:ui-monospace,Consolas,monospace" readonly id="brief-text">${esc(text)}</textarea>
+        <div class="btns"><button type="button" class="btn" data-act="close">Schließen</button><button type="button" class="btn primary" data-act="copy">Kopieren</button></div>`, {
+        close: () => closeModal(null),
+        copy: async () => {
+          const ta = document.getElementById("brief-text");
+          try { await navigator.clipboard.writeText(ta.value); } catch (e) { ta.select(); document.execCommand("copy"); }
+          toast("Kopiert – jetzt bei der KI einfügen.");
+        },
+      });
+    },
     topName: (el) => { st.tops[+el.dataset.t].name = el.value; saveDraft(); },
     subName: (el) => { st.tops[+el.dataset.t].subs[+el.dataset.s].name = el.value; saveDraft(); },
     delTop: (el) => { st.tops.splice(+el.dataset.t, 1); saveDraft(); drawStructure(); },
@@ -2534,7 +2642,19 @@ function drawReorgHub(r) {
   };
 }
 
+function drawReorgFinishing(r) {
+  const pct = r.total ? Math.round((r.done / r.total) * 100) : 0;
+  setHTML(`<div class="screen">${topbar("Zur Startseite", "back", "Ablage neu ordnen")}
+    <main class="wrap narrow"><div class="stack g10"><h1 class="title">Ich schließe ab …</h1>
+      <p class="lead">Was du nicht einsortiert hast, kopiere ich in den Ordner „_Noch zu sortieren“ – damit im neuen Ordner nichts fehlt.</p></div>
+      <section class="card big stack g16"><div class="row g12"><div class="spinner small"></div><span class="muted">${r.done || 0} von ${r.total || 0}</span></div>
+      <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}"><div style="width:${pct}%"></div></div></section>
+    </main></div>`);
+  S.actions = { back: () => go("home") };
+}
+
 function drawReorgDone(r) {
+  if (r.target) return drawReorgDoneCopy(r);
   const removed = (r.removed_dirs || []).length;
   setHTML(`<div class="screen">${topbar("Zur Startseite", "back", "Ablage neu ordnen")}
     <div class="waiting"><div class="big-icon">${I.check(40, 2.4)}</div><h1 class="title">Deine Ablage ist jetzt aufgeräumt!</h1>
@@ -2542,6 +2662,31 @@ function drawReorgDone(r) {
     <div class="row g12 wrapflex" style="justify-content:center"><button type="button" class="btn tall" data-act="history">Zum Verlauf</button>
     <button type="button" class="btn primary tall shadow" data-act="back">Zur Startseite</button></div></div></div>`);
   S.actions = { back: () => { S.reorgJustDone = false; go("home"); }, history: () => { S.reorgJustDone = false; go("history"); } };
+}
+
+function drawReorgDoneCopy(r) {
+  const target = r.target.split(/[\\/]/).filter(Boolean).pop();
+  setHTML(`<div class="screen">${topbar("Zur Startseite", "back", "Ablage neu ordnen")}
+    <div class="waiting"><div class="big-icon">${I.check(40, 2.4)}</div><h1 class="title">Die neue Ordnung steht!</h1>
+    <p class="lead">Alles liegt jetzt als Kopie in „${esc(target)}“${r.leftover ? ` – ${plural(r.leftover, "Dokument", "Dokumente")} davon in „_Noch zu sortieren“` : ""}. Deine bisherige Ablage ist unverändert.</p>
+    ${r.switched ? `<div class="notice ok">${I.check(20)}<div><b>„${esc(target)}“ ist jetzt deine Ablage.</b>Neue Scans landen ab sofort dort. Den alten Ordner kannst du löschen, wenn du zufrieden bist – das mache ich nicht für dich.</div></div>`
+      : `<div class="card stack g12" style="max-width:36rem;text-align:left"><b style="font-size:1.1875rem">Neuen Ordner ab jetzt als Ablage verwenden?</b>
+      <span class="muted">Dann landen neue Scans dort, und Suche, Fristen und Mappen zeigen auf die neuen Dateien. Du kannst das auch später in den Einstellungen umstellen.</span>
+      <div class="row g10 wrapflex"><button type="button" class="btn primary" data-act="switch">Ja, umstellen</button><button type="button" class="btn" data-act="later">Später</button></div></div>`}
+    <div class="row g12 wrapflex" style="justify-content:center"><button type="button" class="btn tall" data-act="open">Neuen Ordner öffnen</button>
+    <button type="button" class="btn tall" data-act="history">Zum Verlauf</button>
+    <button type="button" class="btn primary tall shadow" data-act="back">Zur Startseite</button></div></div></div>`);
+  S.actions = {
+    back: () => { S.reorgJustDone = false; go("home"); },
+    history: () => { S.reorgJustDone = false; go("history"); },
+    open: () => tryCall("open_folder", r.target),
+    later: () => { S.reorgJustDone = false; go("home"); },
+    switch: async (el) => {
+      el.disabled = true;
+      const res = await tryCall("reorg_use_target");
+      if (res) { await refreshState(); S.state.reorg = await tryCall("reorg_status"); toast(`Deine Ablage ist jetzt „${res.library}“.`); render(); } else el.disabled = false;
+    },
+  };
 }
 
 /* ===================== Start ===================== */
@@ -2555,7 +2700,7 @@ async function init() {
   }
   if (!hasBridge()) startDevPolling();
   if (!S.state.settings.setup_done) go("setup");
-  else if (S.state.queue.total === 0 && S.state.reorg && ["backup", "reading", "structure", "structure_review", "review", "paused"].includes(S.state.reorg.phase)) go("reorg");
+  else if (S.state.queue.total === 0 && S.state.reorg && ["backup", "reading", "structure", "structure_review", "review", "paused", "finishing"].includes(S.state.reorg.phase)) go("reorg");
   else go("home");
 }
 

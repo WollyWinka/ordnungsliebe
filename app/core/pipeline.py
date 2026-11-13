@@ -82,6 +82,7 @@ class Pipeline:
         self.reorg_folders: list[str] = []          # erlaubte Ordner während einer Neuordnung
         self.reorg_group: str = ""
         self.reorg_kept: set[str] = set()           # Neuordnung: Dokumente, die schon richtig liegen
+        self.reorg_target: Path | None = None        # Neuordnung in neuen Ordner: Ziel (Kopien statt Verschieben)
         self.on_reorg_folder_added = None            # Rückruf: neuer Ordner während der Neuordnung
         self.on_filed = None                         # Rückruf: Dokument wurde abgelegt (für die Suche)
         self._worker = threading.Thread(target=self._work, name="analyse", daemon=True)
@@ -329,12 +330,12 @@ class Pipeline:
                          "folder_display": naming.display_folder(folder), "date": when,
                          "reason": hit.get("reason", "")})
 
-    def _folder_info(self, folders: list[str], with_files: bool) -> dict[str, dict]:
-        root = self.library_root
+    def _folder_info(self, folders: list[str], with_files: bool, root: Path | None = None) -> dict[str, dict]:
+        root = root or self.library_root
         schemes = self.schemes.for_library(root)
         info = {}
         for f in folders:
-            entry = {"scheme": schemes.get(f, {}).get("scheme", "")}
+            entry = {"scheme": schemes.get(f, {}).get("scheme", ""), "desc": schemes.get(f, {}).get("desc", "")}
             files = library.folder_examples(root, f) if with_files else []
             if not files and schemes.get(f, {}).get("example"):
                 files = [schemes[f]["example"]]
@@ -359,7 +360,8 @@ class Pipeline:
         suggestion = tasks.classify(
             self.ai, text=item["text"], original=Path(item["src"]), kind=item["kind"],
             page_count=item["page_count"], folders=folders,
-            folder_info=self._folder_info(folders, with_files=item["origin"] == "inbox"),
+            folder_info=self._folder_info(folders, with_files=item["origin"] == "inbox",
+                                          root=self.reorg_target if item["origin"] == "reorg" else None),
             examples=self.memory.similar(item["text"]), excluded=item["excluded"], allow_new=allow_new,
             user_hints=self.hints.relevant(item["text"]), doc_hint=item.get("hint", ""),
             folder_counts=self.folder_counts(item["origin"]), new_only_below=below, persons=persons)
@@ -397,6 +399,8 @@ class Pipeline:
         return cached
 
     def _auto_keep_if_unchanged(self, item: dict) -> None:
+        if self.reorg_target is not None:
+            return  # beim Kopieren in einen neuen Ordner muss jedes Dokument hinüber
         src = Path(item["src"])
         try:
             current = "/".join(src.parent.relative_to(self.library_root).parts)
@@ -517,11 +521,26 @@ class Pipeline:
         src = Path(item["src"])
         if not src.exists():
             raise FileNotFoundError("Die Datei ist nicht mehr im Scan-Ordner.")
-        root = self.library_root
+        copy_mode = item["origin"] == "reorg" and self.reorg_target is not None
+        root = self.reorg_target if copy_mode else self.library_root
         target_dir = naming.folder_to_path(root, folder)
         stem = filename if filename else s.get("filename", src.name)
 
-        if item["origin"] == "reorg":
+        if copy_mode:
+            if folder and folder not in self.reorg_folders:
+                self.reorg_folders.append(folder)
+                if self.on_reorg_folder_added:
+                    try:
+                        self.on_reorg_folder_added(folder)
+                    except Exception:
+                        log.exception("Neuer Ordner konnte nicht in die Struktur übernommen werden")
+            target = target_dir / naming.clean_filename(stem, src.suffix)
+            created = [str(p) for p in library.missing_parents(target)]
+            dst = library.copy_file(src, target, sha=item.get("sha", ""))
+            entry = self.history.add("reorg", str(src), str(dst), folder, group=item.get("group", ""),
+                                     dst_sha=item.get("sha", "") or reader.file_hash(dst),
+                                     dst_size=dst.stat().st_size, created_dirs=created, copy=True)
+        elif item["origin"] == "reorg":
             if folder and folder not in self.reorg_folders:
                 self.reorg_folders.append(folder)
                 if self.on_reorg_folder_added:
@@ -590,10 +609,11 @@ class Pipeline:
         mem = self.memory.add(item.get("text", ""), mem_folder, mem_name, ref=entry["id"], original_name=src.name,
                               ai_folder=ai_folder, ai_reason=s.get("reason", ""),
                               hint=item.get("hint", ""))
-        self._record_meta(item, dst, folder, s, sha=entry.get("info", {}).get("dst_sha") or "", entry_id=entry["id"])
+        if not copy_mode:  # Kopien zählen erst, wenn die neue Ablage übernommen wird
+            self._record_meta(item, dst, folder, s, sha=entry.get("info", {}).get("dst_sha") or "", entry_id=entry["id"])
         self.history.update(entry["id"], info={**entry.get("info", {}), "ai_folder": s.get("folder", ""),
                                                "reason": s.get("reason", ""), "corrected": mem["corrected"]})
-        if s and s.get("is_new_folder") and s.get("folder") == folder:
+        if s and s.get("is_new_folder") and s.get("folder") == folder and not self.schemes.for_library(root).get(folder):
             self.schemes.set_one(root, folder, "JJJJ-MM Dokumentart", dst.stem)
         rechecked = 0
         if mem["corrected"]:

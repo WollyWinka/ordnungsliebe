@@ -228,7 +228,7 @@ class Refiner(_Background):
         counts = library.folder_counts(root, skip_photos=True)
         out = [{"folder": f, "display": naming.display_folder(f), "count": c}
                for f, c in counts.items()
-               if f and c >= REFINE_MIN_DOCS and len(f.split("/")) < 3]
+               if f and c >= REFINE_MIN_DOCS and len(f.split("/")) < naming.MAX_LEVELS]
         out.sort(key=lambda x: -x["count"])
         return out[:20]
 
@@ -261,7 +261,7 @@ class Refiner(_Background):
         if self.ctx.reorg_active():
             raise ValueError("Bitte schließe erst die laufende Neuordnung ab.")
         folder = naming.clean_folder(folder)
-        if not folder or len(folder.split("/")) >= 3 or not naming.folder_to_path(root, folder).is_dir():
+        if not folder or len(folder.split("/")) >= naming.MAX_LEVELS or not naming.folder_to_path(root, folder).is_dir():
             raise ValueError("Diesen Ordner kann ich nicht weiter unterteilen.")
         self.state = {"phase": "reading", "folder": folder, "library": str(root), "done": 0, "total": 0}
         self._save()

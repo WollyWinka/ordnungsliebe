@@ -25,10 +25,13 @@ def clean_part(name: str, fallback: str = "Dokument") -> str:
     return name
 
 
+MAX_LEVELS = 4  # höchstens vier Ordner-Ebenen
+
+
 def clean_folder(path: str) -> str:
-    """Relativer Ordnerpfad mit „/“, höchstens drei Ebenen, jede Ebene bereinigt."""
+    """Relativer Ordnerpfad mit „/“, höchstens vier Ebenen, jede Ebene bereinigt."""
     parts = [p for p in re.split(r"[/\\]+", path or "") if p.strip()]
-    parts = [clean_part(p, "Sonstiges") for p in parts][:3]
+    parts = [clean_part(p, "Sonstiges") for p in parts][:MAX_LEVELS]
     return "/".join(parts)
 
 
@@ -105,7 +108,7 @@ def apply_person(folder: str, filename: str, person: str, persons: list[str], mo
     if not person or mode == "merken":
         return folder, filename
     parts = [p for p in folder.split("/") if p]
-    if mode == "unterordner" and parts and len(parts) < 3:
+    if mode == "unterordner" and parts and len(parts) < MAX_LEVELS:
         return "/".join(parts + [person]), filename
     stem, suffix = _split_suffix(filename)
     return folder, f"{stem}{PERSON_SEP}{person}{suffix}"
