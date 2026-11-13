@@ -796,6 +796,11 @@ class Api:
         path = export.export_zip(name, docs, target_dir) if fmt == "zip" else export.export_pdf(name, docs, target_dir)
         return {"path": str(path), "name": path.name, "folder": setup.pretty_path(str(path.parent))}
 
+    @api_method
+    def report_ui_error(self, message: str):
+        log.warning("Fehler in der Oberfläche: %s", str(message)[:2000])
+        return True
+
     # --- Mails weiterleiten (F) -------------------------------------------------------------
     @api_method
     def mail_status(self):

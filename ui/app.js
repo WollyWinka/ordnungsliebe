@@ -41,6 +41,13 @@ async function call(name, ...args) {
   return res.data;
 }
 
+// Fehler in der Oberfläche ins Protokoll schreiben, damit man sie später findet
+function reportError(msg) {
+  try { if (hasBridge()) window.pywebview.api.report_ui_error(String(msg).slice(0, 2000)); } catch (e) { /* egal */ }
+}
+window.addEventListener("error", (ev) => reportError(`${ev.message} @ ${ev.filename}:${ev.lineno}`));
+window.addEventListener("unhandledrejection", (ev) => reportError(`Promise: ${ev.reason && (ev.reason.stack || ev.reason.message || ev.reason)}`));
+
 async function tryCall(name, ...args) {
   try { return await call(name, ...args); }
   catch (e) { toast(e.message); return undefined; }
@@ -818,12 +825,12 @@ function agoText(ts) {
 }
 
 function mailCardHTML() {
-  const m = S.mail;
-  if (!m) return "";
+  const m = S.mail || { address: "", has_password: false };
   const head = `<h2 style="font-size:1.3125rem" class="row g10">${I.mail()} Mails weiterleiten</h2>`;
   if (!m.address || !m.has_password) {
     return `<section class="card stack g12">${head}
       <span class="muted">Leite Rechnungen und Dokumente einfach vom Handy an eine eigene Ablage-Adresse weiter. Ich hole sie ab, solange ich geöffnet bin, und lege den Anhang oder die ganze Mail ab.</span>
+      ${m.statusError ? `<span class="tiny muted">(${esc(m.statusError)})</span>` : ""}
       <button type="button" class="btn violet" style="align-self:flex-start" data-act="mailSetup">Ablage-Postfach einrichten</button></section>`;
   }
   const unknown = (m.unknown || []).map((u) => `<div class="row g10 wrapflex"><span class="grow" style="flex-basis:14rem;overflow-wrap:anywhere"><b>${esc(u.address)}</b>${u.subject ? ` <span class="small muted">„${esc(u.subject)}“</span>` : ""}</span>
@@ -1797,7 +1804,10 @@ function loadHints() {
 }
 
 SCREENS.settings = () => {
-  if (!S.soft) call("mail_status").then((m) => { S.mail = m; redrawMailCard(); }).catch(() => {});
+  if (!S.soft) {
+    call("mail_status").then((m) => { S.mail = m; redrawMailCard(); })
+      .catch((e) => { reportError("mail_status: " + e.message); S.mail = { address: "", has_password: false, statusError: e.message }; redrawMailCard(); });
+  }
   if (!S.params.fresh) {
     // Werte im Hintergrund auffrischen und nur bei Änderungen sanft nachzeichnen (kein zweites Einblenden)
     const before = JSON.stringify(S.state.settings);
