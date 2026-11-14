@@ -192,6 +192,8 @@ class MailFetcher:
                 clean.append(a)
         if enabled and not clean:
             raise ValueError("Bitte mindestens eine Absender-Adresse eintragen (die Adresse, von der du weiterleitest).")
+        if password and prov["key"] in ("gmail", "icloud"):
+            password = re.sub(r"\s+", "", password)  # App-Passwörter werden mit Leerzeichen angezeigt
         if password:
             self.test(address, password, host, port)
             jsonfile.save(self.secret_file, {"password": _protect(password.encode("utf-8"))})
